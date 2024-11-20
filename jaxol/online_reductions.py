@@ -8,53 +8,14 @@ import optax
 from optax import Updates, Params, OptState, ScalarOrSchedule, GradientTransformation
 from typing import Any, Tuple, NamedTuple, Optional, Union, Callable, Protocol
 import sys
-
-# Define the weight_ratio r_t = w_{t-1}/w_t ,  where w_t is the weight on the t^th iterate.
-# So, if for any sequence x_t we define:
-# S_T = sum_{t=1}^T w_t x_t / w_T
-# then we have:
-# S_T = S_{T-1}*r_T + x_T
-# as an application, for  alpha_t = w_t/w_{1:t}, we have
-# 1/alpha_t = 1/alpha_{t-1} * r_t + 1
-# alpha_t = alpha_{t-1}/(r_t + alpha_{t-1})
-# Also, if
-# Z_T = sum_{t=1}^T w_t^p x_t/w_T^p
-# then we have:
-# Z_T = Z_{t-1} * r_T^p + x_t
-# Therefore, for gamma_t = w_t^2/w^2_{1:t}, we have
-# 1/gamma_t = 1/gamma_{t-1} * r_t^2 + 1
-# gamma_t = gamma_{t-1}/(r_t^2 + gamma_{t-1})
-
-# We will ask users to provide us with the next weight ratio r_{t+1} at time t.
-
-
-# We define the averaging factor is defined as:
-# alpha_t = w_t/w_{1:t}
-# Notice that alpha_t is 1-beta_t for the familiar EMA beta.
-# We can solve for the weight ratio as follows:
-# r_t = alpha_{t-1}/alpha_t -1
-
-
-def get_next_weight_ratio(averaging_factor, next_averaging_factor):
-    return averaging_factor / next_averaging_factor - 1.0
-
-
-def get_next_averaging_factor(next_weight_ratio, averaging_factor):
-    return averaging_factor / (next_weight_ratio + averaging_factor)
-
-
-def get_next_accumulation(next_weight_ratio, accumulation, next_value):
-    return accumulation * next_weight_ratio + next_value
-
-
-class OnlineLearner(optax.GradientTransformation):
-    pass
-    # init_fn: Callable
-    # update_fn: Callable
-    # def init(params: optax.Params):
-    #     return self.init_fn(params)
-    # def update(self, grad: optax.Updates, state: NamedTuple, *, weight_factor: jax.Array, params: optax.Params, **extra_kwargs):
-    #     return self.update_fn(grad, state, weight_factor=weight_factor, params=params, **extra_kwargs)
+from jaxol.online_learner import (
+    OnlineLearner,
+    Context,
+    to_OL,
+    get_next_weight_ratio,
+    get_next_averaging_factor,
+    get_next_accumulation,
+)
 
 
 class GeneralizedAveragingState(NamedTuple):
@@ -72,12 +33,40 @@ def get_constant_beta_fn(beta):
     return lambda grads, state, params: (beta, state.beta_state)
 
 
+def get_linear_decay_beta_fn(decay_end, decay_start=0):
+    def beta_fn(grads, state, params):
+        decay_beta = (decay_end - state.step_count) / (decay_end - decay_start)
+
+        beta = 1.0 - jnp.minimum(1.0, decay_beta)
+
+        return (beta, state.weight_state)
+
+    return beta_fn
+
+
 def uniform_weight_fn(grads, state, params):
     return (1.0, state.weight_state)
 
 
 def linear_weight_ratio_fn(grads, state, params):
-    return (state.step_count / (state.step_count + 1), state.weight_state)
+    return ((state.step_count + 1) / (state.step_count + 2), state.weight_state)
+
+
+def get_polynomial_weight_ratio_fn(power=1):
+    def weight_ratio_fn(grads, state, params):
+        return (
+            (state.step_count + 1) ** power / (state.step_count + 2) ** power,
+            state.weight_state,
+        )
+
+    return weight_ratio_fn
+
+
+def get_step_transform_weight_ratio_fn(tx: Callable[float, float] = lambda x: x**2):
+    def weight_ratio_fn(grads, state, params):
+        return (tx(state.step_count + 1) / tx(state.step_count + 2), state.weight_state)
+
+    return weight_ratio_fn
 
 
 def get_ema_weight_ratio_fn(beta):
@@ -85,6 +74,7 @@ def get_ema_weight_ratio_fn(beta):
         return (beta, state.weight_state)
 
     return ema_weight_ratio_fn
+
 
 def get_random_beta_fn(min_beta=0):
     def random_beta_fn(grads, state, params):
@@ -170,30 +160,11 @@ def generalized_averaging(
             next_weight_ratio, state.averaging_factor
         )
 
-        # jax.debug.print(
-        #     "next averaging factor:  {x}, weight ratio:  {y}",
-        #     x=next_averaging_factor,
-        #     y=next_weight_ratio,
-        # )
         base_updates, next_base_state = base_optimizer.update(
             grads, state.base_state, params=params, next_weight_ratio=next_weight_ratio
         )
 
         beta, next_beta_state = beta_fn(grads, state, params)
-
-        # def recover_iterate(p_i, avg_i):
-        #     return (p_i - state.last_beta * avg_i) / (1 - state.last_beta)
-
-        # base_iterate = jtu.tree_map(recover_iterate, params, state.average_iterate)
-
-        # next_iterate = optax.apply_updates(base_iterate, base_updates)
-
-        # def update_average_iterate(old_average_i, new_iterate_i):
-        #     return old_average_i + (new_iterate_i - old_average_i) * next_averaging_factor
-
-        # next_average_iterate = jtu.tree_map(
-        #     update_average_iterate, state.average_iterate, base_iterate
-        # )
 
         m_in_next_m_ratio = next_averaging_factor * (1.0 / state.averaging_factor - 1.0)
 
@@ -201,11 +172,6 @@ def generalized_averaging(
             return m_in_next_m_ratio * mi + next_averaging_factor * base_ui
 
         next_momentum = jtu.tree_map(update_momentum, state.momentum, base_updates)
-
-        # def get_updates(avg_i, base_i, p_i):
-        #     return avg_i * beta + (1 - beta) * base_i - p_i
-
-        # updates = jtu.tree_map(get_updates, next_average_iterate, next_iterate, params)
 
         m_in_update_ratio = state.last_beta + (state.last_beta - beta) * (
             1.0 / next_averaging_factor - 1.0
@@ -232,62 +198,6 @@ def generalized_averaging(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def GT_to_OL(tx: optax.GradientTransformation):
-    def init_fn(params):
-        return tx.init(params)
-
-    def update_fn(
-        grads: optax.Updates, state: NamedTuple, params: optax.Params, **extra_kwargs
-    ):
-        return tx.update(grads, state, params)
-
-    return OnlineLearner(init_fn, update_fn)
-
-
-# class GT_to_OL(OnlineLearner):
-#     tx: optax.GradientTransformation
-
-#     # def __init__(self, tx: optax.GradientTransformation):
-#     #     self.tx = tx
-
-
-#     def init(self, params: optax.Params):
-#         return self.tx.init(params)
-#     def update(self, grads: optax.Updates, state: NamedTuple, params: optax.Params, **extra_kwargs):
-#         return self.tx.update(grads, state, params)
-#         # updates, next_state = self.tx.update(grads, state, params)
-#         # next_params = optax.apply_updates(params, updates)
-#         # return next_params, next_state
-
-
-class OLtoGTState(NamedTuple):
-    ol_state: Any
-    count: jax.Array
-
-
-def OL_to_GT(ol: OnlineLearner):
-    def init_fn(params):
-        ol_state = ol.init(params)
-        return OLtoGTState(ol_state=ol_state, count=0.0)
-
-    def update_fn(grads, state, params, next_weight_ratio=None, **extra_kwargs):
-        if next_weight_ratio is None:
-            next_weight_ratio = 1.0
-        ol_update, ol_state = ol.update(
-            grads,
-            state.ol_state,
-            params=params,
-            next_weight_ratio=next_weight_ratio,
-            **extra_kwargs
-        )
-        return ol_update, ol_state
-        # next_params, next_state = ol.update(grads, state, params=params, weight_factor=weight_factor, **extra_kwargs)
-        # updates = otu.tree_sub(next_params, params)
-        # return updates, next_state
-
-    return optax.GradientTransformation(ol.init, update_fn)
-
-
 class OneDReductionState(NamedTuple):
     # g_sum: optax.Updates
     # s_sum: optax.Updates
@@ -295,16 +205,6 @@ class OneDReductionState(NamedTuple):
     direction_state: Any
     prev_direction: optax.Updates
     prev_scale: jax.Array
-
-
-def to_OL(tx: Any):
-    if not isinstance(tx, OnlineLearner):
-        if isinstance(tx, optax.GradientTransformation):
-            return GT_to_OL(tx)
-        else:
-            raise ValueError("unknown tx type!")
-    else:
-        return tx
 
 
 def one_d_reduction(
@@ -332,10 +232,9 @@ def one_d_reduction(
     def update_fn(
         grads: optax.Updates,
         state: OneDReductionState,
-        *,
-        params: optax.Params,
         next_weight_ratio: jax.Array,
-        **extra_kwargs
+        params: optax.Params,
+        context: Optional[Context] = None,
     ):
         # next_g_sum = otu.tree_add_scalar_mul(state.g_sum, grads, weight_factor)
         # g_sum_norm = otu.tree_l2_norm(next_g_sum) + 1e-8
@@ -344,9 +243,9 @@ def one_d_reduction(
         direction_updates, next_direction_state = direction_learner.update(
             grads,
             state.direction_state,
-            params=state.prev_direction,
             next_weight_ratio=next_weight_ratio,
-            **extra_kwargs
+            params=state.prev_direction,
+            context=context,
         )
         direction = otu.tree_add(state.prev_direction, direction_updates)
 
@@ -355,9 +254,9 @@ def one_d_reduction(
         scale_updates, next_scale_state = scale_learner.update(
             scale_grads,
             state.scale_state,
-            params=state.prev_scale,
             next_weight_ratio=next_weight_ratio,
-            **extra_kwargs
+            params=state.prev_scale,
+            context=context,
         )
         scale = otu.tree_add(state.prev_scale, scale_updates)
 
@@ -402,16 +301,16 @@ def average_offset_ol(
     def update_fn(
         grads: optax.Updates,
         state: AverageOffsetState,
-        *,
-        params: optax.Params,
         next_weight_ratio: jax.Array,
-        **extra_kwargs
+        params: optax.Params,
+        context: Optional[Context],
     ):
         base_updates, base_state = base_learner.update(
             grads,
             state.base_state,
-            params=state.base_params,
             next_weight_ratio=next_weight_ratio,
+            params=state.base_params,
+            context=context,
         )
 
         next_averaging_factor = get_next_averaging_factor(
@@ -473,8 +372,6 @@ def chain(*learners):
     return OnlineLearner(init_fn, update_fn)
 
 
-
-
 #### special learner that learns a direction, not actually a true online learner
 class UnitDirectionLearnerState(NamedTuple):
     grad_sum: optax.Updates
@@ -491,9 +388,9 @@ def unit_direction_learner() -> OnlineLearner:
         grads: optax.Updates,
         state: UnitDirectionLearnerState,
         *,
-        params: optax.Params,
         next_weight_ratio: jax.Array,
-        **extra_kwargs
+        params: optax.Params,
+        context: Optional[Context] = None
     ):
         next_grad_sum = jtu.tree_map(
             lambda s, g: get_next_accumulation(next_weight_ratio, s, g),
@@ -523,240 +420,6 @@ def unit_direction_learner() -> OnlineLearner:
         next_state = UnitDirectionLearnerState(
             grad_sum=next_grad_sum,
             s_sum=next_s_sum,
-        )
-
-        return updates, next_state
-
-    return OnlineLearner(init_fn, update_fn)
-
-
-
-#### simple diagonal ftrl with quadratic regularizer
-class FTRLState(NamedTuple):
-    grad_sum: optax.Updates
-    grad_squared_sum: optax.Updates
-
-
-def ftrl_learner(radius: Optional[jax.Array] = None) -> OnlineLearner:
-    def init_fn(params):
-        return FTRLState(
-            grad_sum=otu.tree_zeros_like(params),
-            grad_squared_sum=otu.tree_zeros_like(params),
-        )
-
-    def update_fn(
-        grads: optax.Updates,
-        state: OneDReductionState,
-        *,
-        params: optax.Params,
-        next_weight_ratio: jax.Array,
-        **extra_kwargs
-    ):
-        next_grad_sum = jtu.tree_map(
-            lambda s_i, g_i: get_next_accumulation(next_weight_ratio, s_i, g_i),
-            state.grad_sum,
-            grads,
-        )
-
-        next_grad_squared_sum = jtu.tree_map(
-            lambda s_i, g_i: get_next_accumulation(
-                next_weight_ratio**2, s_i, g_i**2
-            ),
-            state.grad_squared_sum,
-            grads,
-        )
-
-        def get_update(next_sum, next_squared_sum, cur_sum, cur_squared_sum):
-            cur_value = -cur_sum / jnp.sqrt(cur_squared_sum + 1e-8)
-            if radius is not None:
-                cur_value = jnp.clip(cur_value, -radius, radius)
-            next_value = -next_sum / jnp.sqrt(next_squared_sum + 1e-8)
-            if radius is not None:
-                next_value = jnp.clip(next_value, -radius, radius)
-
-            return next_value - cur_value
-
-        updates = jtu.tree_map(
-            get_update,
-            next_grad_sum,
-            next_grad_squared_sum,
-            state.grad_sum,
-            state.grad_squared_sum,
-        )
-
-        next_state = FTRLState(
-            grad_sum=next_grad_sum,
-            grad_squared_sum=next_grad_squared_sum,
-        )
-
-        return updates, next_state
-
-    return OnlineLearner(init_fn, update_fn)
-
-
-
-
-#### laprop
-class LaPropState(NamedTuple):
-    grad_squared_sum: optax.Updates
-    momentum: optax.Updates
-
-
-def laprop_learner(beta1: float, beta2: float) -> OnlineLearner:
-    def init_fn(params):
-        return LaPropState(
-            momentum=otu.tree_zeros_like(params),
-            grad_squared_sum=otu.tree_zeros_like(params),
-        )
-
-    def update_fn(
-        grads: optax.Updates,
-        state: OneDReductionState,
-        *,
-        params: optax.Params,
-        next_weight_ratio: jax.Array,
-        **extra_kwargs
-    ):
-        next_grad_squared_sum = jtu.tree_map(
-            lambda s_i, g_i: get_next_accumulation(beta2, s_i, (1-beta2)*g_i**2),
-            state.grad_squared_sum,
-            grads,
-        )
-
-        def get_normalized_grad(g, next_squared_sum):
-            return -g / jnp.sqrt(next_squared_sum + 1e-8)
-
-        normalized_grad = jtu.tree_map(
-            get_normalized_grad,
-            grads,
-            next_grad_squared_sum,
-        )
-
-        next_momentum = jtu.tree_map(
-            lambda m_i, g_i: get_next_accumulation(beta1, m_i, g_i),
-            state.momentum,
-            normalized_grad,
-        )
-
-        next_state = LaPropState(
-            momentum=next_momentum,
-            grad_squared_sum=next_grad_squared_sum,
-        )
-
-        updates = next_momentum
-
-        return updates, next_state
-
-    return OnlineLearner(init_fn, update_fn)
-
-
-
-
-
-##### mirror descent learners
-class MDState(NamedTuple):
-    grad_squared_sum: optax.Updates
-
-
-def mirrordescent_learner(beta: float, lr_rescale=1.0) -> OnlineLearner:
-    if lr_rescale == 'beta':
-        lr_rescale = 1.0/jnp.sqrt(1.0-beta)
-    def init_fn(params):
-        return MDState(grad_squared_sum=otu.tree_zeros_like(params))
-
-    def update_fn(
-        grads: optax.Updates,
-        state: OneDReductionState,
-        *,
-        params: optax.Params,
-        next_weight_ratio: jax.Array,
-        **extra_kwargs
-    ):
-        if beta is not None:
-            ratio = beta
-        else:
-            ratio = next_weight_ratio
-
-        next_grad_squared_sum = jtu.tree_map(
-            lambda s_i, g_i: get_next_accumulation(ratio, s_i, g_i**2),
-            state.grad_squared_sum,
-            grads,
-        )
-
-        def get_update(g, next_squared_sum):
-            return - lr_rescale  * g / jnp.sqrt(next_squared_sum + 1e-8)
-
-        updates = jtu.tree_map(
-            get_update,
-            grads,
-            next_grad_squared_sum,
-        )
-
-        next_state = MDState(
-            grad_squared_sum=next_grad_squared_sum,
-        )
-
-        return updates, next_state
-
-    return OnlineLearner(init_fn, update_fn)
-
-
-class OptimisticMDState(NamedTuple):
-    prev_grad: optax.Updates
-    grad_squared_sum: optax.Updates
-    averaging_factor: float
-
-
-def optimisticmirrordescent_learner(beta: float) -> OnlineLearner:
-    def init_fn(params):
-        return OptimisticMDState(prev_grad=otu.tree_zeros_like(params), grad_squared_sum=otu.tree_zeros_like(params), averaging_factor=1.0)
-
-    def update_fn(
-        grads: optax.Updates,
-        state: OneDReductionState,
-        *,
-        params: optax.Params,
-        next_weight_ratio: jax.Array,
-        **extra_kwargs
-    ):
-        if beta is not None:
-            ratio = beta
-        else:
-            ratio = next_weight_ratio
-
-        next_grad_squared_sum = jtu.tree_map(
-            lambda s_i, g_i, p_i: get_next_accumulation(ratio, s_i, (g_i-p_i)**2),
-            state.grad_squared_sum,
-            grads,
-            state.prev_grad
-        )
-
-        def get_update(g, p, prev_squared_sum, next_squared_sum):
-            current_update = -g / jnp.sqrt(g**2 + next_squared_sum + 1e-8)
-            prev_update = -p/jnp.sqrt(p**2 + prev_squared_sum + 1e-8)
-            return 2*current_update - prev_update
-
-        updates = jtu.tree_map(
-            get_update,
-            grads,
-            state.prev_grad,
-            state.grad_squared_sum,
-            next_grad_squared_sum,
-        )
-
-        next_averaging_factor = get_next_averaging_factor(
-            next_weight_ratio, state.averaging_factor
-        )
-        next_prev_grad = jtu.tree_map(
-            lambda p_i, g_i: p_i + next_averaging_factor * (g_i-p_i),
-            state.prev_grad,
-            grads
-        )
-
-        next_state = OptimisticMDState(
-            prev_grad=next_prev_grad,
-            averaging_factor=next_averaging_factor,
-            grad_squared_sum=next_grad_squared_sum,
         )
 
         return updates, next_state

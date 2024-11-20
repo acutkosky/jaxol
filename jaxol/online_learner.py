@@ -38,19 +38,18 @@ import sys
 # We will ask users to provide us with the next weight ratio r_{t+1} at time t.
 
 
-
 def get_next_weight_ratio(averaging_factor, next_averaging_factor):
-    '''computes weight ratio r_{t+1} from averaging factors alpha_t and alpha_{t+1}'''
-    return averaging_factor * (1.0/ next_averaging_factor - 1.0)
+    """computes weight ratio r_{t+1} from averaging factors alpha_t and alpha_{t+1}"""
+    return averaging_factor * (1.0 / next_averaging_factor - 1.0)
 
 
 def get_next_averaging_factor(next_weight_ratio, averaging_factor):
-    '''computes averaging factor alpha_{t+1} from weight ratio r_{t+1} and alpha_t'''
+    """computes averaging factor alpha_{t+1} from weight ratio r_{t+1} and alpha_t"""
     return averaging_factor / (next_weight_ratio + averaging_factor)
 
 
 def get_next_accumulation(next_weight_ratio, accumulation, next_value):
-    '''computes S_T  from r_{T+1}, S_{T-1}, and x_T'''
+    """computes S_T  from r_{T+1}, S_{T-1}, and x_T"""
     return accumulation * next_weight_ratio + next_value
 
 
@@ -58,16 +57,16 @@ Context = NamedTuple
 
 
 class OnlineLearner(NamedTuple):
-    init: Callable[[optax.Params], optax.State]
+    init: Callable[[optax.Params], optax.OptState]
     update: Callable[
         [
-            optax.Updates,
-            optax.State,
-            jax.Array,
-            Optional[Context],
-            Optional[optax.Params],
+            optax.Updates,  # grads
+            optax.OptState,  # state
+            jax.Array,  # next_weight_ratio
+            Optional[optax.Params],  # params
+            Optional[Context],  # context
         ],
-        [optax.Updates, optax.State],
+        [optax.Updates, optax.OptState],
     ]
 
 
@@ -79,8 +78,8 @@ def GT_to_OL(tx: optax.GradientTransformation):
         grads: optax.Updates,
         state: NamedTuple,
         next_weight_ratio: jax.Array,
-        context: Optional[Context] = None,
         params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
     ):
         del context
         return tx.update(grads, state, params)
@@ -102,8 +101,8 @@ def OL_to_GT(ol: OnlineLearner):
         grads,
         state,
         next_weight_ratio: Optional[jax.Array],
-        context: Optional[Context] = None,
         params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
     ):
         if next_weight_ratio is None:
             next_weight_ratio = 1.0
@@ -112,10 +111,19 @@ def OL_to_GT(ol: OnlineLearner):
             grads,
             state.ol_state,
             next_weight_ratio=next_weight_ratio,
-            context=context,
             params=params,
-            next_weight_ratio=next_weight_ratio,
+            context=context,
         )
         return ol_update, ol_state
 
     return optax.GradientTransformation(ol.init, update_fn)
+
+
+def to_OL(tx: Any):
+    if not isinstance(tx, OnlineLearner):
+        if isinstance(tx, optax.GradientTransformation):
+            return GT_to_OL(tx)
+        else:
+            raise ValueError("unknown tx type!")
+    else:
+        return tx

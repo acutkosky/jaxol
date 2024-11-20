@@ -1,3 +1,3 @@
-# jaxmodules
+# jaxol
 
-some random jax tools
+online learning in JAX

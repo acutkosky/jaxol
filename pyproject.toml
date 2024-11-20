@@ -3,12 +3,12 @@ requires = ["flit_core>=3.4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "jaxmodules"
+name = "jaxmol"
 version = "0.1"
 authors = [
   { name="Ashok Cutkosky", email="ashok@cutkosky.com" },
 ]
-description = "some potentially useful jax functions"
+description = "an over-engineered  online learning framework in jax"
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
@@ -20,5 +20,5 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/acutkosky/jaxmodules"
-Issues = "https://github.com/acutkosky/jaxmodules/issues"
+Homepage = "https://github.com/acutkosky/jaxol"
+Issues = "https://github.com/acutkosky/jaxol/issues"

@@ -6,7 +6,7 @@ from optax import tree_utils as otu
 import chex
 import optax
 from optax import Updates, Params, OptState, ScalarOrSchedule, GradientTransformation
-from typing import Any, Tuple, NamedTuple, Optional, Union, Callable, Protocol
+from typing import Any, Tuple, NamedTuple, Optional, Union, Callable, Protocol, Tuple
 from tensorflow_probability.substrates import jax as tfp
 import sys
 
@@ -50,7 +50,7 @@ def get_next_averaging_factor(next_weight_ratio, averaging_factor):
 
 def get_next_accumulation(next_weight_ratio, accumulation, next_value):
     """computes S_T  from r_{T+1}, S_{T-1}, and x_T"""
-    return accumulation * next_weight_ratio + next_value
+    return (accumulation + next_value) * next_weight_ratio
 
 
 Context = NamedTuple
@@ -66,7 +66,7 @@ class OnlineLearner(NamedTuple):
             Optional[optax.Params],  # params
             Optional[Context],  # context
         ],
-        [optax.Updates, optax.OptState],
+        Tuple[optax.Updates, optax.OptState],
     ]
 
 

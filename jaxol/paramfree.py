@@ -28,6 +28,7 @@ class DownscaleEpsilonState(NamedTuple):
 # into ones with O(1)  origin-regret
 def downscale_epsilon(
     base_params: optax.Updates,
+    next_weight_ratio: jax.Array,
     origin_regret: jax.Array,
     max_regret: jax.Array,
     max_grad_norm_hint: jax.Array,
@@ -113,11 +114,23 @@ def d2_bigphi(V, S, z, k, eps, alpha):
 
         return jax.grad(to_diff)(s_)
 
-    return jax.vmap(to_vmap)(V, S, z, k)
+    result = jax.vmap(to_vmap)(V, S, z, k)
+    jax.debug.print(
+        "V: {v}\nS: {s}\nz: {z}\nk: {k}\neps\n{eps}\nalpha: {alpha}\nresult: {r}",
+        v=V,
+        s=S,
+        r=result,
+        z=z,
+        k=k,
+        eps=eps,
+        alpha=alpha,
+    )
+    return result
 
     # return jax.grad(lambda s: bigphi(V, s, z, k, eps, alpha))(S)
 
 
+#### I think this one is buggy....
 class RefinedPDEPerCoordState(NamedTuple):
     V: jax.Array
     S: jax.Array
@@ -218,11 +231,13 @@ def refined_pde_per_coord(
         )
 
         if constant_origin_regret:
-            next_origin_regret = state.origin_regret + optax.tree_utils.tree_vdot(
-                grads, unscaled_prev_params
-            )
+            next_origin_regret = (
+                state.origin_regret
+                + optax.tree_utils.tree_vdot(grads, unscaled_prev_params)
+            ) * next_weight_ratio
             next_scaling, next_max_regret = downscale_epsilon(
                 unscaled_next_params,
+                next_weight_ratio,
                 state.origin_regret,
                 state.max_regret,
                 h_t_plus_one,
@@ -245,6 +260,421 @@ def refined_pde_per_coord(
             origin_regret=next_origin_regret,
             max_regret=next_max_regret,
             scaling=next_scaling,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
+
+
+class MirrorDescentState(NamedTuple):
+    sum_squared_grad: jax.Array
+    sum_squared_grad_over_max: jax.Array
+    max_grad: jax.Array
+    sum_grad: jax.Array
+
+
+def mirror_descent(eps: float = 1.0, p: float = 0.5):
+    def init_fn(params: optax.Params):
+        return MirrorDescentState(
+            sum_squared_grad=jax.tree.map(jnp.zeros_like, params),
+            max_grad=jax.tree.map(jnp.zeros_like, params),
+            sum_grad=jax.tree.map(jnp.zeros_like, params),
+            sum_squared_grad_over_max=jax.tree.map(jnp.zeros_like, params),
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: MirrorDescentState,
+        next_weight_ratio: jax.Array,
+        param: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+
+        abs_grad = jax.tree.map(jnp.abs, grads)
+        next_max_grad = jax.tree.map(
+            lambda m, a: jnp.maximum(m, a) * next_weight_ratio, state.max_grad, abs_grad
+        )
+
+        next_sum_squared_grad = jax.tree.map(
+            lambda s, g: (s + g**2) * next_weight_ratio**2,
+            state.sum_squared_grad,
+            grads,
+        )
+
+        next_sum_squared_grad_over_max = jax.tree.map(
+            lambda s, m, g: s + g**2 * next_weight_ratio**2 / (m**2 + 1e-8),
+            state.sum_squared_grad_over_max,
+            next_max_grad,
+            grads,
+        )
+
+        next_sum_grad = jax.tree.map(
+            lambda s, g: (s + g) * next_weight_ratio, state.sum_grad, grads
+        )
+
+        def get_param_value(
+            sum_squared_grad_over_max, max_grad, sum_squared_grad, sum_grad
+        ):
+
+            if p == 0.5:
+                c = 3.0
+                alpha = jax.tree.map(
+                    lambda m: eps / (jnp.sqrt(c + m) * jnp.log(c + m) ** 2),
+                    sum_squared_grad_over_max,
+                )
+            else:
+                c = 1.0
+                alpha = jax.tree.map(
+                    lambda m: eps / (c + m) ** p,
+                    sum_squared_grad_over_max,
+                )
+
+            k = 3.0
+
+            switch = jnp.abs(sum_grad) <= 2 * k * sum_squared_grad / max_grad
+            theta = jax.lax.select(
+                switch,
+                (sum_grad) ** 2 / (4 * k**2 * sum_squared_grad + 1e-8),
+                jnp.abs(sum_grad) / (k * max_grad + 1e-8)
+                - sum_squared_grad / (max_grad + 1e-8),
+            )
+
+            # jax.debug.print("theta: {t}\nsum_grad: {s}\nsum_squared_grad: {q}\nmax_grad: {m}\nswitch: {w}",t=theta,s=sum_grad,q=sum_squared_grad_over_max, m=max_grad, w=switch)
+
+            result = -jnp.sign(sum_grad) * alpha * (jnp.exp(theta) - 1.0)
+
+            return result
+
+        prev_param = get_param_value(
+            state.sum_squared_grad_over_max,
+            state.max_grad,
+            state.sum_squared_grad,
+            state.sum_grad,
+        )
+
+        next_param = get_param_value(
+            next_sum_squared_grad_over_max,
+            next_max_grad,
+            next_sum_squared_grad,
+            next_sum_grad,
+        )
+
+        updates = optax.tree_utils.tree_sub(next_param, prev_param)
+
+        next_state = MirrorDescentState(
+            sum_squared_grad_over_max=next_sum_squared_grad_over_max,
+            max_grad=next_max_grad,
+            sum_squared_grad=next_sum_squared_grad,
+            sum_grad=next_sum_grad,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
+
+
+class RecursiveOptState(NamedTuple):
+    wealth: jax.Array
+    bet_fraction: jax.Array
+    base_state: optax.OptState
+    max_grad: jax.Array
+
+
+def recursive_optimizer(
+    base_opt: OnlineLearner,
+    eps: jax.Array = 1.0,
+    max_bet_fraction_ratio: float = 0.5,
+):
+    #### CAUTION: ONLY WORKS WITH UNIFORM WEIGHTING!!! ####
+    def init_fn(params: optax.Params):
+        base_state = base_opt.init(params)
+        bet_fraction = jax.tree.map(jnp.zeros_like, params)
+        max_grad = 0.0
+        reward = 0.0
+        return RecursiveOptState(
+            wealth=eps,
+            bet_fraction=bet_fraction,
+            base_state=base_state,
+            max_grad=max_grad,
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: RecursiveOptState,
+        next_weight_ratio: jax.Array,
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+        # max_grad is max_{i<t} |g_i| * w_i/w_t
+        # where w_i is the ith weight and next_weight_ratio is r=w_t/w_{t+1}
+        # so next max_grad is max(max_grad*r, |g_t|*r)
+
+        # we want to clip the gradient so that |clipped_g_t|*w_t <= max_{i<t} |g_i| w_i
+        # this is equivalent to |clipped_g_t| <= max_grad
+        l2_norm_grads = optax.tree_utils.tree_l2_norm(grads)
+        clip_ratio = jnp.minimum(state.max_grad / (l2_norm_grads + 1e-8), 1.0)
+        clipped_grads = jax.tree.map(lambda g: clip_ratio * g, grads)
+
+        next_max_grad = jnp.maximum(
+            state.max_grad * next_weight_ratio, l2_norm_grads * next_weight_ratio
+        )
+
+        # wealth is (eps + sum_{i<t} <w_i * g_i, param_i>/w_t
+        # so, next wealth is (wealth + <g_t, param_t>) * r
+
+        # param_t is w_t * wealth_t * bet_t
+
+        # so <g_t, param_t> = <g_t, bet_t> * wealth_t * w_t
+
+        # wealth = eps + state.reward
+        wealth = state.wealth
+
+        def clip_bet_fraction(b, m):
+            norm = optax.tree_utils.tree_l2_norm(b)
+            return optax.tree_utils.tree_scalar_mul(
+                jnp.minimum(max_bet_fraction_ratio / (m * norm + 1e-8), 1.0), b
+            )
+
+        clipped_bet_fraction = clip_bet_fraction(state.bet_fraction, state.max_grad)
+
+        current_iterate = jax.tree.map(lambda b: b * wealth, clipped_bet_fraction)
+
+        grad_dot_bet = optax.tree_utils.tree_vdot(clipped_bet_fraction, clipped_grads)
+
+        next_wealth = (state.wealth + wealth * grad_dot_bet) * next_weight_ratio
+
+        grad_log_loss = jax.tree.map(lambda g: g / (1.0 - grad_dot_bet), clipped_grads)
+
+        def correct_grad_log_loss(g, b):
+            b_norm = optax.tree_utils.tree_l2_norm(b)
+            g_b_dot = optax.tree_utils.tree_vdot(g, b)
+            do_correct = (g_b_dot >= 0) * (
+                b_norm > (max_bet_fraction_ratio / state.max_grad)
+            )
+            correction = optax.tree_utils.tree_scalar_mul(
+                do_correct * g_b_dot / (b_norm + 1e-8) ** 2, b
+            )
+            return optax.tree_utils.tree_sub(g, correction)
+
+        grad_log_loss = correct_grad_log_loss(grad_log_loss, state.bet_fraction)
+
+        bet_fraction_updates, next_base_state = base_opt.update(
+            grad_log_loss,
+            state.base_state,
+            next_weight_ratio,
+            params=state.bet_fraction,
+            context=context,
+        )
+
+        next_bet_fraction = optax.apply_updates(
+            state.bet_fraction, bet_fraction_updates
+        )
+
+        clipped_next_bet_fraction = clip_bet_fraction(next_bet_fraction, next_max_grad)
+
+        next_iterate = optax.tree_utils.tree_scalar_mul(
+            next_wealth, clipped_next_bet_fraction
+        )
+
+        updates = optax.tree_utils.tree_sub(next_iterate, current_iterate)
+
+        next_state = RecursiveOptState(
+            wealth=next_wealth,
+            bet_fraction=next_bet_fraction,
+            base_state=next_base_state,
+            max_grad=next_max_grad,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
+
+
+class ONSBettorState(NamedTuple):
+    wealth: jax.Array
+    bet_fraction: jax.Array
+    max_grad: jax.Array
+    bet_sum_squared_grad: jax.Array
+    wealth_increment: jax.Array
+
+
+def ons_bettor(
+    eps: jax.Array = 1.0,
+    max_bet_fraction: jax.Array = 0.5,
+    do_wealth_increment: jax.Array = False,
+):
+
+    ons_eta = 2.0 / (2.0 - jnp.log(3))
+
+    def init_fn(params: optax.Params):
+        return ONSBettorState(
+            wealth=eps,
+            bet_fraction=optax.tree_utils.tree_zeros_like(params),
+            max_grad=optax.tree_utils.tree_zeros_like(params),
+            bet_sum_squared_grad=optax.tree_utils.tree_zeros_like(params),
+            wealth_increment=0.0,
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: ONSBettorState,
+        next_weight_ratio: jax.Array,
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+
+        abs_grad = jax.tree.map(jnp.abs, grads)
+
+        next_wealth_increment = (state.wealth_increment + 1.0) * next_weight_ratio
+        next_max_grad = jax.tree.map(
+            lambda m, a: next_weight_ratio * jnp.maximum(m, a), state.max_grad, abs_grad
+        )
+
+        grads = jax.tree.map(
+            lambda g, m, a: g * jnp.minimum(1.0, m / (a + 1e-8)),
+            grads,
+            state.max_grad,
+            abs_grad,
+        )
+
+        bet_grad = jax.tree.map(lambda g, b: g / (1 - g * b), grads, state.bet_fraction)
+
+        next_bet_sum_squared_grad = jax.tree.map(
+            lambda s, g: (s + g**2) * next_weight_ratio,
+            state.bet_sum_squared_grad,
+            bet_grad,
+        )
+
+        next_bet_fraction = jax.tree.map(
+            lambda b, s, g: b / next_weight_ratio
+            - ons_eta * g * next_weight_ratio / (s + 1e-8),
+            state.bet_fraction,
+            next_bet_sum_squared_grad,
+            bet_grad,
+        )
+        next_bet_fraction = jax.tree.map(
+            lambda b, a: jnp.clip(
+                b, -max_bet_fraction / (a + 1e-8), max_bet_fraction / (a + 1e-8)
+            ),
+            next_bet_fraction,
+            next_max_grad,
+        )
+
+        next_wealth = jax.tree.map(
+            lambda w, b, g: w * (1 - b * g) * next_weight_ratio,
+            state.wealth,
+            state.bet_fraction,
+            grads,
+        )
+        next_wealth = next_wealth + do_wealth_increment * eps / next_wealth_increment
+
+        prev_param = jax.tree.map(lambda w, b: w * b, state.wealth, state.bet_fraction)
+
+        next_param = jax.tree.map(lambda w, b: w * b, next_wealth, next_bet_fraction)
+
+        updates = optax.tree_utils.tree_sub(next_param, prev_param)
+
+        next_state = ONSBettorState(
+            wealth=next_wealth,
+            max_grad=next_max_grad,
+            bet_fraction=next_bet_fraction,
+            bet_sum_squared_grad=next_bet_sum_squared_grad,
+            wealth_increment=next_wealth_increment,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
+
+
+class ConstantBettorState(NamedTuple):
+    wealth: jax.Array
+    max_grad: jax.Array
+    sum_squared_grad: jax.Array
+    count: jax.Array
+
+
+def constant_bettor(eps: jax.Array = 1.0, bet_fraction: jax.Array = 0.5):
+
+    def init_fn(params: optax.Params):
+        return ConstantBettorState(
+            wealth=eps,
+            max_grad=optax.tree_utils.tree_zeros_like(params),
+            sum_squared_grad=optax.tree_utils.tree_zeros_like(params),
+            count=jnp.zeros([]),
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: ONSBettorState,
+        next_weight_ratio: jax.Array,
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+
+        abs_grad = jax.tree.map(jnp.abs, grads)
+
+        next_count = (state.count + 1) * next_weight_ratio**2
+
+        next_max_grad = jax.tree.map(
+            lambda m, a: next_weight_ratio * jnp.maximum(m, a), state.max_grad, abs_grad
+        )
+
+        grads = jax.tree.map(
+            lambda g, m, a: g * jnp.minimum(1.0, m / (a + 1e-8)),
+            grads,
+            state.max_grad,
+            abs_grad,
+        )
+
+        next_sum_squared_grad = jax.tree.map(
+            lambda s, g: (s + g**2) * next_weight_ratio, state.sum_squared_grad, grads
+        )
+
+        # scaled_next_bet_fraction = jax.tree_map(
+        #     lambda s: bet_fraction/jnp.sqrt(s/(next_count+1e-8)+1e-8),
+        #     next_sum_squared_grad
+        # )
+
+        # scaled_prev_bet_fraction = jax.tree_map(
+        #     lambda s: bet_fraction/jnp.sqrt(s/(state.count+1e-8)+1e-8),
+        #     state.sum_squared_grad
+        # )
+
+        scaled_next_bet_fraction = jax.tree_map(
+            lambda s: bet_fraction / (s + 1e-8),
+            next_max_grad,
+        )
+
+        scaled_prev_bet_fraction = jax.tree_map(
+            lambda s: bet_fraction / (s + 1e-8),
+            state.max_grad,
+        )
+        next_wealth = jax.tree.map(
+            lambda w, b, g: w * (1 - b * g) * next_weight_ratio,
+            state.wealth,
+            scaled_next_bet_fraction,
+            grads,
+        )
+
+        prev_param = jax.tree.map(
+            lambda w, b: w * b,
+            state.wealth,
+            scaled_prev_bet_fraction,
+        )
+
+        next_param = jax.tree.map(
+            lambda w, b: w * b, next_wealth, scaled_next_bet_fraction
+        )
+
+        updates = optax.tree_utils.tree_sub(next_param, prev_param)
+
+        next_state = ConstantBettorState(
+            wealth=next_wealth,
+            max_grad=next_max_grad,
+            sum_squared_grad=next_sum_squared_grad,
+            count=next_count,
         )
 
         return updates, next_state

@@ -32,32 +32,93 @@ class GeneralizedAveragingState(NamedTuple):
 
 
 def get_constant_beta_fn(beta):
-    return lambda grads, step_count, state, params: (beta, state)
+    return lambda grads, state, next_weight_ratio, params: (beta, state.beta_state)
 
 
 def get_poly_beta_fn(p, c=1.0):
-    return lambda grads, step_count, state, params: (
-        jnp.clip(1.0 - c * (step_count + 1.0) ** (-p), 0.0, 1.0),
-        state,
+    return lambda grads, state, next_weight_ratio, params: (
+        jnp.clip(1.0 - c * (state.step_count + 1.0) ** (-p), 0.0, 1.0),
+        state.beta_state,
     )
 
 
 def get_cosine_beta_fn(period=100):
-    return lambda grads, step_count, state, params: (
-        0.5 - 0.5 * jnp.cos(step_count * 2 * jnp.pi / period),
-        state,
+    return lambda grads, state, next_weight_ratio, params: (
+        0.5 - 0.5 * jnp.cos(state.step_count * 2 * jnp.pi / period),
+        state.beta_state,
     )
 
 
+class SumWeightedPowGradBetaState(NamedTuple):
+    sum_pow_grad: float
+
+def get_sum_weighted_pow_grad_beta_fn(p=2.0):
+    def beta_fn(grads, state, next_weight_ratio, params):
+        sum_pow_grad = state.beta_state.sum_pow_grad
+        norm_grad = optax.tree_utils.tree_l2_norm(grads)
+        next_sum_pow_grad = (sum_pow_grad + norm_grad**p) * next_weight_ratio*p
+        next_state = SumWeightedPowGradBetaState(next_sum_pow_grad)
+
+        beta = jnp.maximum(0.0, 1.0-next_weight_ratio * norm_grad*(next_sum_pow_grad + 1e-8)**(1.0/p))
+
+        return beta, next_state
+    return beta_fn
+    
+class SumPowGradBetaState(NamedTuple):
+    sum_pow_grad: float
+
+def get_sum_pow_grad_beta_fn(p=2.0):
+    def beta_fn(grads, state, next_weight_ratio, params):
+        sum_pow_grad = state.beta_state.sum_pow_grad
+        norm_grad = optax.tree_utils.tree_l2_norm(grads)
+        next_sum_pow_grad = sum_pow_grad + norm_grad**p
+        next_state = SumPowGradBetaState(next_sum_pow_grad)
+
+        beta = jnp.maximum(0.0, 1.0-(norm_grad)*(next_sum_pow_grad + 1e-8)**(1.0/p))
+
+        return beta, next_state
+    return beta_fn
+
 def get_linear_decay_beta_fn(decay_end, decay_start=0):
-    def beta_fn(grads, step_count, state, params):
-        decay_beta = (decay_end - step_count) / (decay_end - decay_start)
+    def beta_fn(grads, state, next_weight_ratio, params):
+        decay_beta = (decay_end - state.step_count) / (decay_end - decay_start)
 
         beta = 1.0 - jnp.minimum(1.0, decay_beta)
 
-        return (beta, state)
+        return (beta, state.beta_state)
 
     return beta_fn
+
+class AcceleratedBetaState(NamedTuple):
+    alpha: float
+
+def get_accelerated_beta_fn(coef=1.0, p=1.0):
+    def beta_fn(grads, state, next_weight_ratio, params):
+        alpha = state.beta_state.alpha
+        # alpha =  w^p_{1:t}/w_t^p
+        next_alpha = alpha * next_weight_ratio**p + 1
+        beta = jnp.maximum(0.0, 1.0 - coef * next_alpha**(1.0/p))
+        next_state = AcceleratedBetaState(alpha)
+
+        return beta, next_state
+    return beta_fn
+
+class RestartingWeightRatioState(NamedTuple):
+    ratio: float
+
+def get_restart_weight_ratio_fn(coefficient=0.5):
+    def weight_ratio_fn(grads, state, params):
+        correlation = (optax.tree_utils.tree_vdot(JOU.tree_l2_normalize(grads), JOU.tree_l2_normalize(state.updates)))**2
+        ratio = 1.0 - jnp.maximum(0.0, correlation)*coefficient
+        next_state = RestartingWeightRatioState(
+            ratio
+        )
+
+        # jax.debug.print("ratio: {r}", r=ratio)
+
+        return ratio, next_state
+
+    return weight_ratio_fn
 
 class CorrelationWeightRatioState(NamedTuple):
     avg_correlation: float
@@ -105,7 +166,7 @@ def get_polynomial_weight_ratio_fn(power=1):
     def weight_ratio_fn(grads, state, params):
         return (
             (state.step_count + 1) ** power / (state.step_count + 2) ** power,
-            state.weioght_state,
+            state.weight_state,
         )
 
     return weight_ratio_fn
@@ -217,7 +278,7 @@ def generalized_averaging(
         )
 
         beta, next_beta_state = beta_fn(
-            grads, state.step_count, state.beta_state, params
+            grads, state, next_weight_ratio, params
         )
 
         m_in_next_m_ratio = next_averaging_factor * (1.0 / state.averaging_factor - 1.0)
@@ -230,6 +291,10 @@ def generalized_averaging(
         m_in_update_ratio = state.last_beta + (state.last_beta - beta) * (
             1.0 / next_averaging_factor - 1.0
         )
+
+        # jax.debug.print("next averaging_factor: {a}",a=next_averaging_factor)
+
+        # jax.debug.print("m in update_ratio: {r}", r=m_in_update_ratio)
 
         def get_updates(m_i, base_i):
             return m_in_update_ratio * m_i + (1.0 - state.last_beta) * base_i

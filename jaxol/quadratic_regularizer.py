@@ -16,19 +16,117 @@ from jaxol.online_learner import (
     get_next_averaging_factor,
     get_next_accumulation,
 )
+import jaxol.utils as JOU
+
+
+class BigLRState(NamedTuple):
+    params: optax.Params
+    total_sum_squared_grad: jax.Array
+    sum_squared_grad: jax.Array
+    sum_grad: optax.Updates
+    total_loss: jax.Array
+    reset_count: jax.Array
+
+
+def big_lr_learner(lr: float = 1.0/jnp.sqrt(2.0), radius: float = 1.0, allow_resets=True) -> OnlineLearner:
+    def init_fn(params):
+        return BigLRState(
+            params=otu.tree_zeros_like(params),
+            total_sum_squared_grad=0.0,
+            sum_squared_grad=0.0,
+            sum_grad=otu.tree_zeros_like(params),
+            total_loss=0.0,
+            reset_count=0,
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: BigLRState,
+        next_weight_ratio: jax.Array,
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+
+        # process the grads to remove correlations
+        g_x = otu.tree_vdot(state.params, grads)
+
+        next_total_loss = (state.total_loss + g_x) * next_weight_ratio
+        next_sum_grad = jax.tree.map(
+            lambda s, g: (s + g) * next_weight_ratio, state.sum_grad, grads
+        )
+
+        grad_norm = otu.tree_l2_norm(grads)
+        param_norm_squared = otu.tree_l2_norm(state.params, squared=True)
+
+        do_offset = (otu.tree_l2_norm(state.params) >= radius) * (g_x < 0)
+        # do_offset = False
+        grads = jax.tree.map(
+            lambda g, p: g - p * g_x * do_offset / (param_norm_squared + 1e-8),
+            grads,
+            state.params,
+        )
+
+        next_total_loss = (
+            state.total_loss + otu.tree_vdot(state.params, grads)
+        ) * next_weight_ratio
+
+        next_sum_squared_grad = (
+            state.sum_squared_grad + otu.tree_l2_norm(grads, squared=True)
+        ) * next_weight_ratio**2
+        next_total_sum_squared_grad = (
+            state.total_sum_squared_grad + otu.tree_l2_norm(grads, squared=True)
+        ) * next_weight_ratio**2
+
+        if allow_resets:
+            do_reset = (
+                next_total_loss + radius * otu.tree_l2_norm(next_sum_grad)
+            ) <= 2 * radius * jnp.sqrt(next_total_sum_squared_grad)
+        else:
+            do_reset = False
+
+        next_reset_count = state.reset_count + do_reset
+
+        next_sum_squared_grad = jax.lax.select(
+            do_reset,
+            otu.tree_l2_norm(grads, squared=True) * next_weight_ratio**2,
+            next_sum_squared_grad,
+        )
+        next_params = jax.tree.map(
+            lambda p, s, g: p
+            - lr * radius * g * next_weight_ratio / jnp.sqrt(s + 1e-8),
+            state.params,
+            next_sum_squared_grad,
+            grads,
+        )
+
+        next_params = JOU.tree_l2_clip(next_params, r=radius)
+
+        updates = otu.tree_sub(next_params, state.params)
+
+        next_state = BigLRState(
+            params=next_params,
+            total_sum_squared_grad=next_total_sum_squared_grad,
+            sum_squared_grad=next_sum_squared_grad,
+            sum_grad=next_sum_grad,
+            total_loss=next_total_loss,
+            reset_count=next_reset_count,
+        )
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
 
 
 #### simple diagonal ftrl with quadratic regularizer
 class FTRLState(NamedTuple):
-    grad_sum: optax.Updates
-    grad_squared_sum: optax.Updates
+    sum_grad: optax.Updates
+    sum_squared_grad: optax.Updates
 
 
 def ftrl_learner(lr: float = 1.0, radius: Optional[jax.Array] = None) -> OnlineLearner:
     def init_fn(params):
         return FTRLState(
-            grad_sum=otu.tree_zeros_like(params),
-            grad_squared_sum=otu.tree_zeros_like(params),
+            sum_grad=otu.tree_zeros_like(params),
+            sum_squared_grad=otu.tree_zeros_like(params),
         )
 
     def update_fn(
@@ -38,9 +136,9 @@ def ftrl_learner(lr: float = 1.0, radius: Optional[jax.Array] = None) -> OnlineL
         params: optax.Params,
         context: Optional[Context] = None,
     ):
-        next_grad_sum = jtu.tree_map(
+        next_sum_grad = jtu.tree_map(
             lambda s_i, g_i: (s_i + g_i) * next_weight_ratio,
-            state.grad_sum,
+            state.sum_grad,
             grads,
         )
         # next_grad_sum = jtu.tree_map(
@@ -48,16 +146,16 @@ def ftrl_learner(lr: float = 1.0, radius: Optional[jax.Array] = None) -> OnlineL
         #     state.grad_sum,
         #     grads,
         # )
-        next_grad_squared_sum = jtu.tree_map(
+        next_sum_squared_grad = jtu.tree_map(
             lambda s_i, g_i: (s_i + g_i**2) * next_weight_ratio**2,
-            state.grad_squared_sum,
+            state.sum_squared_grad,
             grads,
         )
-        # next_grad_squared_sum = jtu.tree_map(
+        # next_sum_squared_grad = jtu.tree_map(
         #     lambda s_i, g_i: get_next_accumulation(
         #         next_weight_ratio**2, s_i, g_i**2
         #     ),
-        #     state.grad_squared_sum,
+        #     state.sum_squared_grad,
         #     grads,
         # )
 
@@ -73,15 +171,15 @@ def ftrl_learner(lr: float = 1.0, radius: Optional[jax.Array] = None) -> OnlineL
 
         updates = jtu.tree_map(
             get_update,
-            next_grad_sum,
-            next_grad_squared_sum,
-            state.grad_sum,
-            state.grad_squared_sum,
+            next_sum_grad,
+            next_sum_squared_grad,
+            state.sum_grad,
+            state.sum_squared_grad,
         )
 
         next_state = FTRLState(
-            grad_sum=next_grad_sum,
-            grad_squared_sum=next_grad_squared_sum,
+            sum_grad=next_sum_grad,
+            sum_squared_grad=next_sum_squared_grad,
         )
 
         return updates, next_state
@@ -144,8 +242,10 @@ def laprop_learner(beta1: float, beta2: float) -> OnlineLearner:
 
 ##### mirror descent learners
 
+
 class OGDState(NamedTuple):
     lr: jax.Array
+
 
 def ogd_learner(lr: float) -> OnlineLearner:
 
@@ -284,7 +384,9 @@ class L2CorrelationLossState(NamedTuple):
     sum_correlations: jax.Array
 
 
-def l2_correlation_learner(lr=1.0, r_max=1.0, inner_product_scale=1.0, do_sqrt_scale=False):
+def l2_correlation_learner(
+    lr=1.0, r_max=1.0, inner_product_scale=1.0, do_sqrt_scale=False
+):
     def init_fn(params: optax.Params):
         return L2CorrelationLossState(
             0.0,

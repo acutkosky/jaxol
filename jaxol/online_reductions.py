@@ -21,6 +21,7 @@ import jaxol.utils as JOU
 
 class GeneralizedAveragingState(NamedTuple):
     momentum: optax.Params
+    updates: optax.Updates
     # average_iterate: optax.Params
     base_state: optax.OptState
     step_count: jax.Array
@@ -33,11 +34,20 @@ class GeneralizedAveragingState(NamedTuple):
 def get_constant_beta_fn(beta):
     return lambda grads, step_count, state, params: (beta, state)
 
+
 def get_poly_beta_fn(p, c=1.0):
-    return lambda grads, step_count, state, params: (jnp.clip(1.0-c*(step_count+1.0)**(-p), 0.0, 1.0), state)
+    return lambda grads, step_count, state, params: (
+        jnp.clip(1.0 - c * (step_count + 1.0) ** (-p), 0.0, 1.0),
+        state,
+    )
+
 
 def get_cosine_beta_fn(period=100):
-    return lambda grads, step_count, state, params: (0.5-0.5*jnp.cos(step_count*2*jnp.pi/period), state)
+    return lambda grads, step_count, state, params: (
+        0.5 - 0.5 * jnp.cos(step_count * 2 * jnp.pi / period),
+        state,
+    )
+
 
 def get_linear_decay_beta_fn(decay_end, decay_start=0):
     def beta_fn(grads, step_count, state, params):
@@ -49,41 +59,74 @@ def get_linear_decay_beta_fn(decay_end, decay_start=0):
 
     return beta_fn
 
+class CorrelationWeightRatioState(NamedTuple):
+    avg_correlation: float
+    sum_squared_grad: float
+    prev_squared_norm_grad: float
+    ratio: float
 
-def uniform_weight_fn(grads, step_count, state, params):
-    return (1.0, state)
+def update_correlation_weight_ratio_fn(grads, state, params):
+    correlation = (optax.tree_utils.tree_vdot(grads, JOU.tree_l2_normalize(state.updates)))**2
+
+    avg_correlation, sum_squared_grad, prev_squared_norm_grad, prev_ratio = state.weight_state
+
+    squared_norm_grad = optax.tree_utils.tree_l2_norm(grads, squared=True)
+    next_sum_squared_grad = sum_squared_grad + squared_norm_grad
+    
+    next_avg_correlation = avg_correlation + (
+        correlation  - avg_correlation
+    ) / (state.step_count + 1)
+
+    prev_weight = 1.0/(avg_correlation+1e-8) + prev_squared_norm_grad/(sum_squared_grad+1e-8)
+    next_weight = 1.0/(next_avg_correlation+1e-8) + squared_norm_grad/(next_sum_squared_grad +1e-8)
+
+    ratio = jnp.minimum(1.0, prev_weight/next_weight)
+
+    # jax.debug.print("ratio: {r}",r=ratio)
+    next_state = CorrelationWeightRatioState(
+        avg_correlation=next_avg_correlation,
+        sum_squared_grad=next_sum_squared_grad,
+        prev_squared_norm_grad=squared_norm_grad,
+        ratio=ratio
+    )
+    return ratio, next_state
 
 
-def linear_weight_ratio_fn(grads, step_count, state, params):
-    return ((step_count + 1) / (step_count + 2), state)
+def uniform_weight_fn(grads, state, params):
+    return (1.0, state.weight_state)
+
+
+def linear_weight_ratio_fn(grads, state, params):
+    result = ((state.step_count + 1) / (state.step_count + 2), state.weight_state)
+    return result
 
 
 def get_polynomial_weight_ratio_fn(power=1):
-    def weight_ratio_fn(grads, step_count, state, params):
+    def weight_ratio_fn(grads, state, params):
         return (
-            (step_count + 1) ** power / (step_count + 2) ** power,
-            state,
+            (state.step_count + 1) ** power / (state.step_count + 2) ** power,
+            state.weioght_state,
         )
 
     return weight_ratio_fn
 
 
 def get_step_transform_weight_ratio_fn(tx: Callable[float, float] = lambda x: x**2):
-    def weight_ratio_fn(grads, step_count, state, params):
-        return (tx(step_count + 1) / tx(step_count + 2), state)
+    def weight_ratio_fn(grads, state, params):
+        return (tx(state.step_count + 1) / tx(state.step_count + 2), state.weight_state)
 
     return weight_ratio_fn
 
 
 def get_ema_weight_ratio_fn(beta):
-    def ema_weight_ratio_fn(grads, step_count, state, params):
-        return (beta, state)
+    def ema_weight_ratio_fn(grads, state, params):
+        return (beta, state.weight_state)
 
     return ema_weight_ratio_fn
 
 
 def get_random_beta_fn(min_beta=0):
-    def random_beta_fn(grads, step_count, state, params):
+    def random_beta_fn(grads, step_count, state, beta_state, params):
         to_use, rng = jr.split(state)
         beta = jr.uniform(to_use, minval=min_beta)
         return beta, rng
@@ -138,6 +181,7 @@ def generalized_averaging(
 
     def init_fn(params: optax.Params):
         base_state = base_optimizer.init(params)
+        updates = jtu.tree_map(jnp.zeros_like, params)
         # average_iterate = jtu.tree_map(jnp.zeros_like, params)
         momentum = jtu.tree_map(jnp.zeros_like, params)
         weight_state = weight_state_init(params)
@@ -145,6 +189,7 @@ def generalized_averaging(
 
         return GeneralizedAveragingState(
             momentum=momentum,
+            updates=updates,
             # average_iterate=average_iterate,
             base_state=base_state,
             step_count=0,
@@ -158,7 +203,7 @@ def generalized_averaging(
         grads: optax.Updates, state: GeneralizedAveragingState, params: optax.Params
     ):
         next_weight_ratio, next_weight_state = next_weight_ratio_fn(
-            grads, state.step_count, state.weight_state, params
+            grads, state, params
         )
 
         next_averaging_factor = get_next_averaging_factor(
@@ -171,7 +216,9 @@ def generalized_averaging(
             grads, state.base_state, params=params, next_weight_ratio=next_weight_ratio
         )
 
-        beta, next_beta_state = beta_fn(grads, state.step_count, state.beta_state, params)
+        beta, next_beta_state = beta_fn(
+            grads, state.step_count, state.beta_state, params
+        )
 
         m_in_next_m_ratio = next_averaging_factor * (1.0 / state.averaging_factor - 1.0)
 
@@ -192,6 +239,7 @@ def generalized_averaging(
 
         next_state = GeneralizedAveragingState(
             momentum=next_momentum,
+            updates=updates,
             # average_iterate=next_average_iterate,
             base_state=next_base_state,
             step_count=state.step_count + 1,
@@ -282,9 +330,10 @@ def one_d_reduction(
         # g_sum = otu.tree_zeros_like(params)
         # s_sum = jnp.zeros(1)
         scale_state = scale_learner.init(jnp.zeros(1))
+        # print("init scale state:", scale_state)
         direction_state = direction_learner.init(params)
 
-        return OneDReductionState(
+        result = OneDReductionState(
             # g_sum=g_sum,
             # s_sum=s_sum,
             scale_state=scale_state,
@@ -292,6 +341,8 @@ def one_d_reduction(
             prev_direction=otu.tree_zeros_like(params),
             prev_scale=jnp.zeros(1),
         )
+        # print("result: ",result)
+        return result
 
     def update_fn(
         grads: optax.Updates,
@@ -344,7 +395,6 @@ def one_d_reduction(
         else:
             processed_scale = scale
             prev_processed_scale = state.prev_scale
-            
 
         next_param = otu.tree_scalar_mul(processed_scale, direction_to_use)
         prev_param = otu.tree_scalar_mul(prev_processed_scale, prev_direction_to_use)
@@ -405,7 +455,7 @@ def average_offset_ol(base_learner: OnlineLearner, grad_scale=False) -> OnlineLe
         )
         # jax.debug.print("grads in offset: {g}",g=grads)
         if grad_scale:
-            next_weight_scale = optax.tree_utils.tree_l2_norm(grads)**2 + 1e-8
+            next_weight_scale = optax.tree_utils.tree_l2_norm(grads) ** 2 + 1e-8
         else:
             next_weight_scale = 1.0
 
@@ -479,22 +529,25 @@ class UnitDirectionLearnerState(NamedTuple):
 def unit_direction_learner(preprocess_grads=lambda g: g) -> OnlineLearner:
     def init_fn(params):
         return UnitDirectionLearnerState(
-            grad_sum=otu.tree_zeros_like(params), s_sum=1.0, prev_s_sum=0.0,  # jnp.zeros(1)
+            grad_sum=otu.tree_zeros_like(params),
+            s_sum=1.0,
+            prev_s_sum=0.0,  # jnp.zeros(1)
         )
 
     def update_fn(
         grads: optax.Updates,
         state: UnitDirectionLearnerState,
         next_weight_ratio: jax.Array,
-        params: Optional[optax.Params]=None,
-        context: Optional[Context] = None
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
     ):
         orig_grads = grads
         grads = preprocess_grads(grads)
         # jax.debug.print("grads: {g}",g=orig_grads)
         # jax.debug.print("grad norm: {n}, new norm: {p}",n=optax.tree_utils.tree_l2_norm(orig_grads), p=optax.tree_utils.tree_l2_norm(grads))
         next_grad_sum = jtu.tree_map(
-            lambda s, g: (s + g)*next_weight_ratio, #get_next_accumulation(next_weight_ratio, s, g),
+            lambda s, g: (s + g)
+            * next_weight_ratio,  # get_next_accumulation(next_weight_ratio, s, g),
             state.grad_sum,
             grads,
         )
@@ -505,7 +558,8 @@ def unit_direction_learner(preprocess_grads=lambda g: g) -> OnlineLearner:
         )
 
         next_s_sum = jtu.tree_map(
-            lambda old_sum, s: (old_sum + s)*next_weight_ratio, #get_next_accumulation(next_weight_ratio, old_sum, s),
+            lambda old_sum, s: (old_sum + s)
+            * next_weight_ratio,  # get_next_accumulation(next_weight_ratio, old_sum, s),
             state.s_sum,
             next_s,
         )
@@ -517,12 +571,9 @@ def unit_direction_learner(preprocess_grads=lambda g: g) -> OnlineLearner:
         # next_direction = jax.tree.map(lambda x: -x, next_direction)
 
         prev_direction = otu.tree_scalar_mul(
-            -jnp.sign(state.prev_s_sum)/(otu.tree_l2_norm(state.grad_sum)+1e-8),
-            state.grad_sum
+            -jnp.sign(state.prev_s_sum) / (otu.tree_l2_norm(state.grad_sum) + 1e-8),
+            state.grad_sum,
         )
-
-
-        
 
         updates = otu.tree_sub(next_direction, prev_direction)
 
@@ -632,3 +683,118 @@ def add_noise(
         return updates, NoiseState(next_key)
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+class SumSquaredStabilizerState(NamedTuple):
+    base_state: optax.OptState
+    sum_squared_grad: optax.Updates
+    max_grad: optax.Updates
+    sum_grad: optax.Updates
+    update_count: jax.Array
+    next_weight_ratio: jax.Array
+
+
+def sum_squared_stablizer(
+    base_learner: OnlineLearner,
+    threshold: jax.Array = 1.0,
+    use_max_grad=False,
+):
+
+    def init_fn(params: optax.Params):
+        base_state = base_learner.init(params)
+        sum_squared_grad = 0.0
+        sum_grad = jax.tree.map(jnp.zeros_like, params)
+        max_grad = 0.0
+        update_count = 0
+        next_weight_ratio = 1.0
+
+        return SumSquaredStabilizerState(
+            base_state=base_state,
+            sum_squared_grad=sum_squared_grad,
+            max_grad=max_grad,
+            sum_grad=sum_grad,
+            update_count=update_count,
+            next_weight_ratio=next_weight_ratio,
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: SumSquaredStabilizerState,
+        next_weight_ratio: jax.Array,
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+
+        grad_norm_squared = optax.tree_utils.tree_l2_norm(grads, squared=True)
+        next_sum_squared_grad = (
+            state.sum_squared_grad + grad_norm_squared
+        ) * next_weight_ratio**2
+        next_max_grad = jnp.maximum(
+            state.max_grad * next_weight_ratio,
+            jnp.sqrt(grad_norm_squared) * next_weight_ratio,
+        )
+
+        next_sum_grad = jax.tree.map(
+            lambda s, g: (s + g) * next_weight_ratio, state.sum_grad, grads
+        )
+
+        next_next_weight_ratio = state.next_weight_ratio * next_weight_ratio
+
+        if use_max_grad:
+            update_threshold = threshold * next_max_grad**2
+        else:
+            update_threshold = threshold * next_sum_squared_grad
+        do_update = (
+            optax.tree_utils.tree_l2_norm(next_sum_grad, squared=True)
+            > update_threshold
+        )
+        # do_update = True
+
+        next_update_count = state.update_count + do_update
+
+        maybe_updates, maybe_next_base_state = base_learner.update(
+            next_sum_grad, state.base_state, next_next_weight_ratio, params, context
+        )
+
+        updates, next_base_state = jax.lax.cond(
+            do_update,
+            lambda: (maybe_updates, maybe_next_base_state),
+            lambda: (optax.tree_utils.tree_zeros_like(maybe_updates), state.base_state),
+        )
+
+        # updates, next_base_state = jax.lax.cond(
+        #     do_update,
+        #     base_learner.update,
+        #     lambda *_: (optax.tree_utils.tree_zeros_like(grads), state.base_state),
+        #     next_sum_grad,
+        #     state.base_state,
+        #     next_next_weight_ratio,
+        #     params,
+        #     context,
+        # )
+
+        next_state = SumSquaredStabilizerState(
+            base_state=next_base_state,
+            sum_squared_grad=next_sum_squared_grad,
+            max_grad=next_max_grad,
+            sum_grad=next_sum_grad,
+            update_count=next_update_count,
+            next_weight_ratio=next_next_weight_ratio,
+        )
+
+        next_state = jax.lax.cond(
+            do_update,
+            lambda: SumSquaredStabilizerState(
+                base_state=next_base_state,
+                sum_squared_grad=jnp.zeros_like(next_sum_squared_grad),
+                max_grad=jnp.zeros_like(next_max_grad),
+                sum_grad=jax.tree.map(jnp.zeros_like, next_sum_grad),
+                update_count=next_update_count,
+                next_weight_ratio=jnp.ones_like(next_next_weight_ratio),
+            ),
+            lambda: next_state,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)

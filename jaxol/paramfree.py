@@ -275,7 +275,7 @@ class MirrorDescentState(NamedTuple):
     param: jax.Array
 
 
-def mirror_descent(eps: float = 1.0, p: float = 0.5):
+def mirror_descent(eps: float = 1.0, p: float = 0.5, k=3.0):
     def init_fn(params: optax.Params):
         return MirrorDescentState(
             sum_squared_grad=jax.tree.map(jnp.zeros_like, params),
@@ -329,7 +329,7 @@ def mirror_descent(eps: float = 1.0, p: float = 0.5):
 
             s_alpha_ratio_minus_one = jax.lax.select(
                 prev_s_alpha != 0.0,
-                (s_alpha - prev_s_alpha)/ prev_s_alpha,
+                s_alpha / prev_s_alpha - 1.0,  # (s_alpha - prev_s_alpha)/ prev_s_alpha,
                 jnp.zeros_like(s_alpha),
             )
 
@@ -337,13 +337,13 @@ def mirror_descent(eps: float = 1.0, p: float = 0.5):
 
             exp_theta_diff_minus_one = jnp.expm1(theta - prev_theta)
 
-            updates = (
-                s_alpha_ratio * exp_theta_diff_minus_one + s_alpha_ratio_minus_one
-            ) * prev_w - s_alpha * exp_theta_diff_minus_one
+            # updates = (
+            #     s_alpha_ratio * exp_theta_diff_minus_one + s_alpha_ratio_minus_one
+            # ) * prev_w - s_alpha * exp_theta_diff_minus_one
 
-            # updates = (exp_theta_diff * s_alpha_ratio - 1.0) * prev_w - s_alpha * (
-            #     exp_theta_diff_minus_one
-            # )
+            updates = (exp_theta_diff * s_alpha_ratio - 1.0) * prev_w - s_alpha * (
+                exp_theta_diff_minus_one
+            )
 
             # next_w = -s_alpha * alpha * (jnp.exp(theta) - 1.0)
             # updates = next_w - prev_w
@@ -351,7 +351,7 @@ def mirror_descent(eps: float = 1.0, p: float = 0.5):
             return updates
 
         def get_theta(sum_squared_grad, max_grad, sum_grad):
-            k = 3.0
+            # k is set as argument in the original learner construction.
 
             switch = jnp.abs(sum_grad) <= 2 * k * sum_squared_grad / max_grad
             theta = jax.lax.select(

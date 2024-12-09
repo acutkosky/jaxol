@@ -756,7 +756,7 @@ class SumSquaredStabilizerState(NamedTuple):
     max_grad: optax.Updates
     sum_grad: optax.Updates
     update_count: jax.Array
-    next_weight_ratio: jax.Array
+    weight_ratio: jax.Array
 
 
 def sum_squared_stablizer(
@@ -791,19 +791,21 @@ def sum_squared_stablizer(
     ):
 
         grad_norm_squared = optax.tree_utils.tree_l2_norm(grads, squared=True)
+        # sum_squared_grad = sum_{i=1}^{t-1} w_i^2 g_i^2/w_{t-1}^2 (not w_t)!
+        # state.weight_ratio = w_{t-1}/w_t
         next_sum_squared_grad = (
-            state.sum_squared_grad + grad_norm_squared
-        ) * next_weight_ratio**2
+            state.sum_squared_grad * state.weight_ratio**2 + grad_norm_squared
+        )
         next_max_grad = jnp.maximum(
-            state.max_grad * next_weight_ratio,
-            jnp.sqrt(grad_norm_squared) * next_weight_ratio,
+            state.max_grad * state.weight_ratio,
+            jnp.sqrt(grad_norm_squared),
         )
 
         next_sum_grad = jax.tree.map(
-            lambda s, g: (s + g) * next_weight_ratio, state.sum_grad, grads
+            lambda s, g: s * state.weight_ratio + g, state.sum_grad, grads
         )
 
-        next_next_weight_ratio = state.next_weight_ratio * next_weight_ratio
+        # next_next_weight_ratio = state.next_weight_ratio * next_weight_ratio
 
         if use_max_grad:
             update_threshold = threshold * next_max_grad**2
@@ -818,7 +820,7 @@ def sum_squared_stablizer(
         next_update_count = state.update_count + do_update
 
         maybe_updates, maybe_next_base_state = base_learner.update(
-            next_sum_grad, state.base_state, next_next_weight_ratio, params, context
+            next_sum_grad, state.base_state, next_weight_ratio, params, context
         )
 
         updates, next_base_state = jax.lax.cond(
@@ -844,7 +846,7 @@ def sum_squared_stablizer(
             max_grad=next_max_grad,
             sum_grad=next_sum_grad,
             update_count=next_update_count,
-            next_weight_ratio=next_next_weight_ratio,
+            weight_ratio=next_weight_ratio,
         )
 
         next_state = jax.lax.cond(
@@ -855,7 +857,7 @@ def sum_squared_stablizer(
                 max_grad=jnp.zeros_like(next_max_grad),
                 sum_grad=jax.tree.map(jnp.zeros_like, next_sum_grad),
                 update_count=next_update_count,
-                next_weight_ratio=jnp.ones_like(next_next_weight_ratio),
+                next_weight_ratio=state.weight_ratio,
             ),
             lambda: next_state,
         )

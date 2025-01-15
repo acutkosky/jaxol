@@ -29,171 +29,19 @@ class GeneralizedAveragingState(NamedTuple):
     weight_state: Any
     averaging_factor: jax.Array
     last_beta: jax.Array
+    weight_ratio: jax.Array
+    m_ratio: jax.Array
+    update_m_coef: jax.Array
 
 
 def get_constant_beta_fn(beta):
     return lambda grads, state, next_weight_ratio, params: (beta, state.beta_state)
-
-
-def get_poly_beta_fn(p, c=1.0):
-    return lambda grads, state, next_weight_ratio, params: (
-        jnp.clip(1.0 - c * (state.step_count + 1.0) ** (-p), 0.0, 1.0),
-        state.beta_state,
-    )
-
-
-def get_cosine_beta_fn(period=100):
-    return lambda grads, state, next_weight_ratio, params: (
-        0.5 - 0.5 * jnp.cos(state.step_count * 2 * jnp.pi / period),
-        state.beta_state,
-    )
-
-
-class SumWeightedPowGradBetaState(NamedTuple):
-    sum_pow_grad: float
-
-def get_sum_weighted_pow_grad_beta_fn(p=2.0):
-    def beta_fn(grads, state, next_weight_ratio, params):
-        sum_pow_grad = state.beta_state.sum_pow_grad
-        norm_grad = optax.tree_utils.tree_l2_norm(grads)
-        next_sum_pow_grad = (sum_pow_grad + norm_grad**p) * next_weight_ratio*p
-        next_state = SumWeightedPowGradBetaState(next_sum_pow_grad)
-
-        beta = jnp.maximum(0.0, 1.0-next_weight_ratio * norm_grad*(next_sum_pow_grad + 1e-8)**(1.0/p))
-
-        return beta, next_state
-    return beta_fn
-    
-class SumPowGradBetaState(NamedTuple):
-    sum_pow_grad: float
-
-def get_sum_pow_grad_beta_fn(p=2.0):
-    def beta_fn(grads, state, next_weight_ratio, params):
-        sum_pow_grad = state.beta_state.sum_pow_grad
-        norm_grad = optax.tree_utils.tree_l2_norm(grads)
-        next_sum_pow_grad = sum_pow_grad + norm_grad**p
-        next_state = SumPowGradBetaState(next_sum_pow_grad)
-
-        beta = jnp.maximum(0.0, 1.0-(norm_grad)*(next_sum_pow_grad + 1e-8)**(1.0/p))
-
-        return beta, next_state
-    return beta_fn
-
-def get_linear_decay_beta_fn(decay_end, decay_start=0):
-    def beta_fn(grads, state, next_weight_ratio, params):
-        decay_beta = (decay_end - state.step_count) / (decay_end - decay_start)
-
-        beta = 1.0 - jnp.minimum(1.0, decay_beta)
-
-        return (beta, state.beta_state)
-
-    return beta_fn
-
-class AcceleratedBetaState(NamedTuple):
-    alpha: float
-
-def get_accelerated_beta_fn(coef=1.0, p=1.0):
-    def beta_fn(grads, state, next_weight_ratio, params):
-        alpha = state.beta_state.alpha
-        # alpha =  w^p_{1:t}/w_t^p
-        next_alpha = alpha * next_weight_ratio**p + 1
-        beta = jnp.maximum(0.0, 1.0 - coef * next_alpha**(1.0/p))
-        next_state = AcceleratedBetaState(alpha)
-
-        return beta, next_state
-    return beta_fn
-
-class RestartingWeightRatioState(NamedTuple):
-    ratio: float
-
-def get_restart_weight_ratio_fn(coefficient=0.5):
-    def weight_ratio_fn(grads, state, params):
-        correlation = (optax.tree_utils.tree_vdot(JOU.tree_l2_normalize(grads), JOU.tree_l2_normalize(state.updates)))**2
-        ratio = 1.0 - jnp.maximum(0.0, correlation)*coefficient
-        next_state = RestartingWeightRatioState(
-            ratio
-        )
-
-        # jax.debug.print("ratio: {r}", r=ratio)
-
-        return ratio, next_state
-
-    return weight_ratio_fn
-
-class CorrelationWeightRatioState(NamedTuple):
-    avg_correlation: float
-    sum_squared_grad: float
-    prev_squared_norm_grad: float
-    ratio: float
-
-def update_correlation_weight_ratio_fn(grads, state, params):
-    correlation = (optax.tree_utils.tree_vdot(grads, JOU.tree_l2_normalize(state.updates)))**2
-
-    avg_correlation, sum_squared_grad, prev_squared_norm_grad, prev_ratio = state.weight_state
-
-    squared_norm_grad = optax.tree_utils.tree_l2_norm(grads, squared=True)
-    next_sum_squared_grad = sum_squared_grad + squared_norm_grad
-    
-    next_avg_correlation = avg_correlation + (
-        correlation  - avg_correlation
-    ) / (state.step_count + 1)
-
-    prev_weight = 1.0/(avg_correlation+1e-8) + prev_squared_norm_grad/(sum_squared_grad+1e-8)
-    next_weight = 1.0/(next_avg_correlation+1e-8) + squared_norm_grad/(next_sum_squared_grad +1e-8)
-
-    ratio = jnp.minimum(1.0, prev_weight/next_weight)
-
-    # jax.debug.print("ratio: {r}",r=ratio)
-    next_state = CorrelationWeightRatioState(
-        avg_correlation=next_avg_correlation,
-        sum_squared_grad=next_sum_squared_grad,
-        prev_squared_norm_grad=squared_norm_grad,
-        ratio=ratio
-    )
-    return ratio, next_state
-
-
-def uniform_weight_fn(grads, state, params):
-    return (1.0, state.weight_state)
-
-
-def linear_weight_ratio_fn(grads, state, params):
-    result = ((state.step_count + 1) / (state.step_count + 2), state.weight_state)
-    return result
-
-
-def get_polynomial_weight_ratio_fn(power=1):
-    def weight_ratio_fn(grads, state, params):
-        return (
-            (state.step_count + 1) ** power / (state.step_count + 2) ** power,
-            state.weight_state,
-        )
-
-    return weight_ratio_fn
-
-
-def get_step_transform_weight_ratio_fn(tx: Callable[float, float] = lambda x: x**2):
-    def weight_ratio_fn(grads, state, params):
-        return (tx(state.step_count + 1) / tx(state.step_count + 2), state.weight_state)
-
-    return weight_ratio_fn
-
 
 def get_ema_weight_ratio_fn(beta):
     def ema_weight_ratio_fn(grads, state, params):
         return (beta, state.weight_state)
 
     return ema_weight_ratio_fn
-
-
-def get_random_beta_fn(min_beta=0):
-    def random_beta_fn(grads, step_count, state, beta_state, params):
-        to_use, rng = jr.split(state)
-        beta = jr.uniform(to_use, minval=min_beta)
-        return beta, rng
-
-    return random_beta_fn
-
 
 def get_inference_parameters(optimizer_state):
     averaging_states = jtu.tree_leaves(
@@ -258,6 +106,9 @@ def generalized_averaging(
             weight_state=weight_state,
             averaging_factor=1.0,
             last_beta=0.0,
+            weight_ratio=1.0,
+            m_ratio=1.0,
+            update_m_coef=1.0,
         )
 
     def update_fn(
@@ -281,16 +132,32 @@ def generalized_averaging(
             grads, state, next_weight_ratio, params
         )
 
-        m_in_next_m_ratio = next_averaging_factor * (1.0 / state.averaging_factor - 1.0)
+        # numerically precise computation of
+        # w_{t+1} * w_{1:t-1} / (w_t * w_{1:t+1})
+        # = (w_{t+1}/w_t) * (1- (w_{t}+ w_{t+1})/w_{1:t+1})
+        # = w_{t+1}/w_t - w_{t+1}/w_{1:t+1} - (w_{t+1}/w_{1:t+1}) * w_{t+1}/w_t
+        # now, set r =  w_t/w_{t+1}=next_weight_ratio
+        # and a = w_{t+1}/w_{1:t+1} = next_averaging_factor
+        # = 1/r - a - a/r
+        # = (1-a)/r - a
+        m_in_next_m_ratio = (1.0-next_averaging_factor)/next_weight_ratio - next_averaging_factor
+        # m_in_next_m_ratio = next_averaging_factor * (1.0 / state.averaging_factor - 1.0)
 
         def update_momentum(mi, base_ui):
             return m_in_next_m_ratio * mi + next_averaging_factor * base_ui
 
         next_momentum = jtu.tree_map(update_momentum, state.momentum, base_updates)
 
-        m_in_update_ratio = state.last_beta + (state.last_beta - beta) * (
-            1.0 / next_averaging_factor - 1.0
-        )
+        #
+        # b_t + (b_t - b_{t+1})*w_{1:t}/w_{t+1}
+        # = b_t +  (b_t - b_{t+1}) * w_{1:t}/w_t * w_t/w_{t+1}
+        # = b_t + (b_t - b_{t+1}) / a_t  * r_{t+1}
+        # where  a_t  = w_t/w_{1:t}
+        # and r_{t+1} = w_t/w_{t+1}
+        m_in_update_ratio = state.last_beta + (state.last_beta - beta)/state.averaging_factor * next_weight_ratio
+        #      * (
+        #     1.0 / next_averaging_factor - 1.0
+        # )
 
         # jax.debug.print("next averaging_factor: {a}",a=next_averaging_factor)
 
@@ -312,6 +179,9 @@ def generalized_averaging(
             weight_state=next_weight_state,
             averaging_factor=next_averaging_factor,
             last_beta=beta,
+            weight_ratio=next_weight_ratio,
+            m_ratio=m_in_next_m_ratio,
+            update_m_coef=m_in_update_ratio,
         )
 
         return updates, next_state
@@ -481,6 +351,118 @@ def one_d_reduction(
 
     return OnlineLearner(init_fn, update_fn)
 
+class PerCoordOneDReductionState(NamedTuple):
+    # g_sum: optax.Updates
+    # s_sum: optax.Updates
+    scale_state: Any
+    direction_state: Any
+    prev_direction: optax.Updates
+    prev_scale: jax.Array
+
+def per_coord_one_d_reduction(
+    scale_learner: OnlineLearner,
+    direction_learner: OnlineLearner,
+    normalize=False,
+    force_positive=True,
+) -> OnlineLearner:
+    direction_learner = to_OL(direction_learner)
+    scale_learner = to_OL(scale_learner)
+
+    def init_fn(params: optax.Params):
+        # g_sum = otu.tree_zeros_like(params)
+        # s_sum = jnp.zeros(1)
+        scale_state = scale_learner.init(params)
+        # print("init scale state:", scale_state)
+        direction_state = direction_learner.init(params)
+
+        result = PerCoordOneDReductionState(
+            # g_sum=g_sum,
+            # s_sum=s_sum,
+            scale_state=scale_state,
+            direction_state=direction_state,
+            prev_direction=otu.tree_zeros_like(params),
+            prev_scale=jnp.zeros(1),
+        )
+        # print("result: ",result)
+        return result
+
+    def update_fn(
+        grads: optax.Updates,
+        state: OneDReductionState,
+        next_weight_ratio: jax.Array,
+        params: optax.Params,
+        context: Optional[Context] = None,
+    ):
+        # next_g_sum = otu.tree_add_scalar_mul(state.g_sum, grads, weight_factor)
+        # g_sum_norm = otu.tree_l2_norm(next_g_sum) + 1e-8
+
+        # jax.debug.print("grads inn 1dred: {g}",g=grads)
+        # direction_grad =
+        direction_updates, next_direction_state = direction_learner.update(
+            grads,
+            state.direction_state,
+            next_weight_ratio=next_weight_ratio,
+            params=state.prev_direction,
+            context=context,
+        )
+        direction = otu.tree_add(state.prev_direction, direction_updates)
+
+        if normalize:
+            direction_to_use = JOU.tree_l2_normalize(direction)
+            prev_direction_to_use = JOU.tree_l2_normalize(state.prev_direction)
+        else:
+            direction_to_use = direction
+            prev_direction_to_use = state.prev_direction
+
+        # jax.debug.print("dir updates: {x}", x = direction_updates)
+
+        scale_grads = jax.tree.map(
+            lambda x,y: x*y,
+            prev_direction_to_use,
+            grads
+        )
+        if force_positive:
+            scale_grads = jax.tree.map(
+                lambda sg, ps: sg * (ps>=0) + sg*(ps<0)*(sg<0),
+                scale_grads,
+                state.prev_scale
+            )
+
+        scale_updates, next_scale_state = scale_learner.update(
+            scale_grads,
+            state.scale_state,
+            next_weight_ratio=next_weight_ratio,
+            params=state.prev_scale,
+            context=context,
+        )
+        scale = otu.tree_add(state.prev_scale, scale_updates)
+
+        if force_positive:
+            processed_scale = jax.tree.map(lambda s: jnp.maximum(0.0, s), scale)
+            prev_processed_scale = jax.tree.map(lambda s: jnp.maximum(0.0, s), state.prev_scale)
+        else:
+            processed_scale = scale
+            prev_processed_scale = state.prev_scale
+
+        next_param = otu.tree_mul(processed_scale, direction_to_use)
+        prev_param = otu.tree_mul(prev_processed_scale, prev_direction_to_use)
+
+        updates = otu.tree_sub(next_param, prev_param)
+        # jax.debug.print("direction: {x}", x=direction)
+        # jax.debug.print("scale grad: {x}",x=scale_grads)
+        # jax.debug.print("scale: {x}",x=scale)
+        # jax.debug.print("nect_param: {x}, params: {y}",x=next_param,y=params)
+
+        next_state = PerCoordOneDReductionState(
+            scale_state=next_scale_state,
+            direction_state=next_direction_state,
+            prev_direction=direction,
+            prev_scale=scale,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
 
 class AverageOffsetState(NamedTuple):
     base_state: Any
@@ -525,7 +507,7 @@ def average_offset_ol(base_learner: OnlineLearner, grad_scale=False) -> OnlineLe
             next_weight_scale = 1.0
 
         next_averaging_factor = get_next_averaging_factor(
-            next_weight_ratio * state.prev_weight_scale / next_weight_scale,
+            next_weight_ratio**2 * state.prev_weight_scale / next_weight_scale,
             state.averaging_factor,
         )
 
@@ -779,7 +761,7 @@ def sum_squared_stablizer(
             max_grad=max_grad,
             sum_grad=sum_grad,
             update_count=update_count,
-            next_weight_ratio=next_weight_ratio,
+            weight_ratio=next_weight_ratio,
         )
 
     def update_fn(
@@ -857,7 +839,7 @@ def sum_squared_stablizer(
                 max_grad=jnp.zeros_like(next_max_grad),
                 sum_grad=jax.tree.map(jnp.zeros_like, next_sum_grad),
                 update_count=next_update_count,
-                next_weight_ratio=state.weight_ratio,
+                weight_ratio=state.weight_ratio,
             ),
             lambda: next_state,
         )

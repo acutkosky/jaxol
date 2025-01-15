@@ -266,6 +266,13 @@ def refined_pde_per_coord(
 
     return OnlineLearner(init_fn, update_fn)
 
+class LogMirrorDescentState(NamedTuple):
+    sum_squared_grad: jax.Array
+    sum_grad: jax.Array
+    param: jax.Array
+
+def log_mirror_descent(eps: float = 1.0, p: float=0.5, k=3.0):
+    raise NotImplementedError
 
 class MirrorDescentState(NamedTuple):
     sum_squared_grad: jax.Array
@@ -275,7 +282,7 @@ class MirrorDescentState(NamedTuple):
     param: jax.Array
 
 
-def mirror_descent(eps: float = 1.0, p: float = 0.5, k=3.0):
+def mirror_descent(eps: float = 1.0, p: float = 0.5, k=3.0, scale_eps=False):
     def init_fn(params: optax.Params):
         return MirrorDescentState(
             sum_squared_grad=jax.tree.map(jnp.zeros_like, params),
@@ -362,17 +369,21 @@ def mirror_descent(eps: float = 1.0, p: float = 0.5, k=3.0):
             )
             return theta
 
+        if scale_eps:
+            rescaled_eps = eps/optax.tree_utils.tree_sum(jax.tree.map(lambda p: p.ndim, grads))
+        else:
+            rescaled_eps = eps
         def get_alpha(sum_squared_grad_over_max):
             if p == 0.5:
                 c = 3.0
                 alpha = jax.tree.map(
-                    lambda m: eps / (jnp.sqrt(c + m) * jnp.log(c + m) ** 2),
+                    lambda m: rescaled_eps / (jnp.sqrt(c + m) * jnp.log(c + m) ** 2),
                     sum_squared_grad_over_max,
                 )
             else:
                 c = 1.0
                 alpha = jax.tree.map(
-                    lambda m: eps / (c + m) ** p,
+                    lambda m: rescaled_eps / (c + m) ** p,
                     sum_squared_grad_over_max,
                 )
             return alpha

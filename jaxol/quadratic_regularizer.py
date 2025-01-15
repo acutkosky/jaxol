@@ -28,7 +28,13 @@ class BigLRState(NamedTuple):
     reset_count: jax.Array
 
 
-def big_lr_learner(lr: float = 1.0/jnp.sqrt(2.0), radius: float = 1.0, allow_resets=True) -> OnlineLearner:
+def big_lr_learner(
+    lr: float = 1.0 / jnp.sqrt(2.0),
+    radius: float = 1.0,
+    allow_resets=True,
+    do_constraint=True,
+    enforce_constraint=True,
+) -> OnlineLearner:
     def init_fn(params):
         return BigLRState(
             params=otu.tree_zeros_like(params),
@@ -58,8 +64,10 @@ def big_lr_learner(lr: float = 1.0/jnp.sqrt(2.0), radius: float = 1.0, allow_res
         grad_norm = otu.tree_l2_norm(grads)
         param_norm_squared = otu.tree_l2_norm(state.params, squared=True)
 
-        do_offset = (otu.tree_l2_norm(state.params) >= radius) * (g_x < 0)
-        # do_offset = False
+        if do_constraint:
+            do_offset = (otu.tree_l2_norm(state.params) >= radius) * (g_x < 0)
+        else:
+            do_offset = False
         grads = jax.tree.map(
             lambda g, p: g - p * g_x * do_offset / (param_norm_squared + 1e-8),
             grads,
@@ -98,8 +106,8 @@ def big_lr_learner(lr: float = 1.0/jnp.sqrt(2.0), radius: float = 1.0, allow_res
             next_sum_squared_grad,
             grads,
         )
-
-        next_params = JOU.tree_l2_clip(next_params, r=radius)
+        if enforce_constraint:
+            next_params = JOU.tree_l2_clip(next_params, r=radius)
 
         updates = otu.tree_sub(next_params, state.params)
 

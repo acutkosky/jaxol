@@ -266,13 +266,6 @@ def refined_pde_per_coord(
 
     return OnlineLearner(init_fn, update_fn)
 
-class LogMirrorDescentState(NamedTuple):
-    sum_squared_grad: jax.Array
-    sum_grad: jax.Array
-    param: jax.Array
-
-def log_mirror_descent(eps: float = 1.0, p: float=0.5, k=3.0):
-    raise NotImplementedError
 
 class MirrorDescentState(NamedTuple):
     sum_squared_grad: jax.Array

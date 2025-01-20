@@ -53,7 +53,7 @@ def get_next_accumulation(next_weight_ratio, accumulation, next_value):
     return (accumulation + next_value) * next_weight_ratio
 
 
-Context = NamedTuple
+Context = dict
 
 
 class OnlineLearner(NamedTuple):

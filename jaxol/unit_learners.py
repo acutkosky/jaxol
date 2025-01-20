@@ -424,3 +424,69 @@ def approxroot_direction_learner(preprocess_grads=lambda g: g, epsilon=1e-8) -> 
     return OnlineLearner(init_fn, update_fn)
 
        
+class PerLayerUnitDirectionLearnerState(NamedTuple):
+    grad_sum: optax.Updates
+    s_sum: jax.Array
+    prev_s_sum: jax.Array
+
+
+def per_layer_unit_direction_learner(preprocess_grads=lambda g: g) -> OnlineLearner:
+    def init_fn(params):
+        return PerLayerUnitDirectionLearnerState(
+            grad_sum=otu.tree_zeros_like(params),
+            s_sum=jax.tree.map(lambda x: 0.0, params),
+            prev_s_sum=jax.tree.map(lambda x: 0.0, params),  # jnp.zeros(1)
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: UnitDirectionLearnerState,
+        next_weight_ratio: jax.Array,
+        params: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+        orig_grads = grads
+        grads = preprocess_grads(grads)
+        # jax.debug.print("grads: {g}",g=orig_grads)
+        # jax.debug.print("grad norm: {n}, new norm: {p}",n=optax.tree_utils.tree_l2_norm(orig_grads), p=optax.tree_utils.tree_l2_norm(grads))
+        next_grad_sum = jtu.tree_map(
+            lambda s, g: (s + g)
+            * next_weight_ratio,  # get_next_accumulation(next_weight_ratio, s, g),
+            state.grad_sum,
+            grads,
+        )
+
+        def get_next_s(gs, g, s_sum):
+            return jnp.sum(gs * g)/(jnp.linalg.nnorm(gs) + 1e-8) * jnp.sign(s_sum)
+
+        next_s = jax.tree.map(get_next_s, state.grad_sum, grads, state.s_sum)
+
+        next_s_sum = jtu.tree_map(
+            lambda old_sum, s: (old_sum + s)
+            * next_weight_ratio,  # get_next_accumulation(next_weight_ratio, old_sum, s),
+            state.s_sum,
+            next_s,
+        )
+
+        next_direction = otu.tree_scalar_mul(
+            -jnp.sign(state.s_sum) / (otu.tree_l2_norm(next_grad_sum) + 1e-8),
+            next_grad_sum,
+        )
+        # next_direction = jax.tree.map(lambda x: -x, next_direction)
+
+        prev_direction = otu.tree_scalar_mul(
+            -jnp.sign(state.prev_s_sum) / (otu.tree_l2_norm(state.grad_sum) + 1e-8),
+            state.grad_sum,
+        )
+
+        updates = otu.tree_sub(next_direction, prev_direction)
+
+        next_state = UnitDirectionLearnerState(
+            grad_sum=next_grad_sum,
+            s_sum=next_s_sum,
+            prev_s_sum=state.s_sum,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)

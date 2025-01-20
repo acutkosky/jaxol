@@ -381,7 +381,7 @@ def per_coord_one_d_reduction(
             scale_state=scale_state,
             direction_state=direction_state,
             prev_direction=otu.tree_zeros_like(params),
-            prev_scale=jnp.zeros(1),
+            prev_scale=otu.tree_zeros_like(params),
         )
         # print("result: ",result)
         return result
@@ -435,6 +435,8 @@ def per_coord_one_d_reduction(
             params=state.prev_scale,
             context=context,
         )
+        print("prev scale: ",state.prev_scale)
+        print("updates: ",scale_updates)
         scale = otu.tree_add(state.prev_scale, scale_updates)
 
         if force_positive:
@@ -472,12 +474,16 @@ class AverageOffsetState(NamedTuple):
     prev_weight_scale: float
 
 
-def average_offset_ol(base_learner: OnlineLearner, grad_scale=False) -> OnlineLearner:
+def average_offset_ol(base_learner: OnlineLearner, grad_scale=False, filter=False, offset_init='zero') -> OnlineLearner:
     base_learner = to_OL(base_learner)
+    
 
     def init_fn(params):
         base_state = base_learner.init(params)
-        offset = otu.tree_zeros_like(params)
+        if offset_init == 'params':
+            offset = params
+        elif offset_init == 'zero':
+            offset = otu.tree_zeros_like(params)
         return AverageOffsetState(
             base_state=base_state,
             base_params=jtu.tree_map(jnp.array, params),  # copy params
@@ -505,6 +511,42 @@ def average_offset_ol(base_learner: OnlineLearner, grad_scale=False) -> OnlineLe
             next_weight_scale = optax.tree_utils.tree_l2_norm(grads) ** 2 + 1e-8
         else:
             next_weight_scale = 1.0
+
+        if filter == 'weight_scale':
+            # only include values that are actually better...
+            next_weight_scale *= jnp.maximum(
+                1e-8, 
+                -(
+                    otu.tree_vdot(
+                        otu.tree_sub(params, state.offset),
+                        grads
+                    )/(otu.tree_l2_norm(otu.tree_sub(params, state.offset)) * otu.tree_l2_norm(state.offset)+1e-8)
+                )
+            )
+        if filter == 'threshold':
+            # only include values that are actually better...
+            params = jax.lax.cond(0 >= otu.tree_vdot(
+                            otu.tree_sub(params, state.offset),
+                            grads
+                        ), lambda: params, lambda: state.offset)
+
+        if filter == 'param_scale':
+            # only include values that are actually better...
+            param_scale = jnp.maximum(
+                0.0, 
+                -(
+                    otu.tree_vdot(
+                        otu.tree_sub(params, state.offset),
+                        grads
+                    )/(otu.tree_l2_norm(otu.tree_sub(params, state.offset)) * otu.tree_l2_norm(state.offset)+1e-8)
+                )
+            )
+            params = jax.tree.map(
+                lambda p, o: o + (p-o) * param_scale,
+                params,
+                state.offset
+            )
+
 
         next_averaging_factor = get_next_averaging_factor(
             next_weight_ratio**2 * state.prev_weight_scale / next_weight_scale,

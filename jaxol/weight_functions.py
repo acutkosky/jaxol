@@ -98,7 +98,32 @@ def param_dist_beta_fn(grads, state, next_weight_ratio, params):
         next_sum_squared_weight,
         next_sum_weight)
     return beta, next_state
+
+   
+
+class InvWeightBetaState(NamedTuple):
+    sum_weight: float
+
+
+
+def inv_weight_beta_fn(grads, state, next_weight_ratio, params):
+
     
+    # S_T = w^2_{1:T}/w_{T+1}^2
+    # S_T = (S_{T-1} * w^2_T/w^2_{T+1} + 1)
+
+    # Z_T = w_{1:T}/w_{T+1}
+    # Z_T = (Z_{T-1} * w_T/w_{T+1} +  1)
+
+    # beta = 1 - sqrt(S_T)/Z_T
+
+    next_sum_weight = state.beta_state.sum_weight * next_weight_ratio + 1
+
+    beta = jnp.maximum(0.0, 1.0-1.0/next_sum_weight)
+
+    next_state = InvWeightBetaState(
+        next_sum_weight)
+    return beta, next_state
 class AvgSqrtWeightBetaState(NamedTuple):
     sum_squared_weight: float
     sum_weight: float
@@ -162,6 +187,15 @@ def get_accelerated_beta_fn(coef=1.0, p=1.0):
 
         return beta, next_state
     return beta_fn
+
+def get_capped_tail_polynomial_weight_ratio_fn(power=0.5, cap=1.0):
+    def weight_ratio_fn(grads, state, params):
+        return (
+            jnp.minimum(1.0 - 1.0/(state.step_count+2) ** power, cap),
+            state.weight_state
+        )
+
+    return weight_ratio_fn
 
 def get_capped_polynomial_weight_ratio_fn(power=0.0, cap=1.0):
     def weight_ratio_fn(grads, state, params):

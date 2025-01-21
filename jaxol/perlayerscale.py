@@ -255,6 +255,13 @@ def layerwise_log_positive_coin_betting(eps: float = 1.0, k=3.0, minvalue=0.0):
             lambda m, a: jnp.maximum(m, a) * next_weight_ratio, state.max_grad, abs_grad
         )
 
+        #  clip the grads
+        grads = jax.tree.map(
+            lambda g, m: jnp.clip(g, -m/next_weight_ratio, m/next_weight_ratio),
+            grads,
+            state.max_grad
+        )
+
         next_sum_squared_grad = jax.tree.map(
             lambda s, g: (s + g**2) * next_weight_ratio**2,
             state.sum_squared_grad,

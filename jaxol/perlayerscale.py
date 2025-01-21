@@ -221,3 +221,92 @@ def layerwise_mirror_descent(eps: float = 1.0, p: float = 0.5, k=3.0, scale_eps=
 
     return OnlineLearner(init_fn, update_fn)
 
+
+class LayerwiseLogPositiveCoinBettingState(NamedTuple):
+    sum_squared_grad: jax.Array
+    reward: jax.Array
+    max_grad: jax.Array
+    sum_grad: jax.Array
+    param: jax.Array
+
+
+def layerwise_log_positive_coin_betting(eps: float = 1.0, k=3.0, minvalue=0.0):
+    def init_fn(params: optax.Params):
+        return LayerwiseLogPositiveCoinBettingState(
+            sum_squared_grad=jax.tree.map(lambda x: 0.0, params),
+            max_grad=jax.tree.map(lambda x: 0.0, params),
+            sum_grad=jax.tree.map(lambda x: 0.0, params),
+            reward=jax.tree.map(lambda x: 0.0, params),
+            param=jax.tree.map(lambda x: 0.0, params),
+        )
+
+    def update_fn(
+        grads: optax.Updates,
+        state: LayerwiseMirrorDescentState,
+        next_weight_ratio: jax.Array,
+        param: Optional[optax.Params] = None,
+        context: Optional[Context] = None,
+    ):
+
+        grads = jax.tree.map(jnp.sum, grads)
+
+        abs_grad = jax.tree.map(jnp.abs, grads)
+        next_max_grad = jax.tree.map(
+            lambda m, a: jnp.maximum(m, a) * next_weight_ratio, state.max_grad, abs_grad
+        )
+
+        next_sum_squared_grad = jax.tree.map(
+            lambda s, g: (s + g**2) * next_weight_ratio**2,
+            state.sum_squared_grad,
+            grads,
+        )
+
+
+        next_sum_grad = jax.tree.map(
+            lambda s, g: (s + g) * next_weight_ratio, state.sum_grad, grads
+        )
+
+        next_reward = jax.tree.map(        
+            lambda r, g, p: (r - g * p) * next_weight_ratio,
+            state.reward,
+            grads,
+            state.param
+        )
+
+        def get_bet(max_grad, sum_squared_grad, sum_grad):
+            v_t = jax.lax.rsqrt(k * max_grad**2 + sum_squared_grad + 1e-8)
+            b_t = v_t * jnp.clip(-sum_grad * v_t, 0, 1)
+            return b_t
+
+        next_bet = jax.tree.map(
+            get_bet,
+            next_max_grad,
+            next_sum_squared_grad,
+            next_sum_grad
+        )
+
+        next_param = jax.tree.map(
+            lambda r, b: jnp.clip((r+eps) * b, minvalue),
+            next_reward,
+            next_bet
+        )
+
+
+        updates = jax.tree.map(
+            lambda a,b: a-b,
+            next_param,
+            state.param
+        )
+
+        next_state = LayerwiseLogPositiveCoinBettingState(
+            max_grad=next_max_grad,
+            sum_squared_grad=next_sum_squared_grad,
+            sum_grad=next_sum_grad,
+            reward=next_reward,
+            param=next_param,
+        )
+
+        return updates, next_state
+
+    return OnlineLearner(init_fn, update_fn)
+
